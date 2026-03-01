@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Blu-ray Backup Manager - A TUI for managing and burning file backups to Blu-ray disks
-Requires: pip install textual
+Requires: pip install textual (version 0.40.0 or higher recommended)
 Optional: growisofs (for burning on Linux), hdiutil/drutil (macOS)
 
 Run tests: python bluray_backup.py --test
@@ -17,12 +17,18 @@ import unittest
 import sys
 from pathlib import Path
 from datetime import datetime
-from typing import Tuple, List, Optional, Dict
-from textual.app import App, ComposeResult
+from typing import Tuple, List, Optional, Dict, Iterable
+from textual.app import App
 from textual.containers import Container, Horizontal
 from textual.widgets import Header, Footer, Button, DataTable, Input, Label, ProgressBar
 from textual.binding import Binding
 from textual.screen import Screen
+
+# For compatibility with older Textual versions
+try:
+    from textual.app import ComposeResult
+except ImportError:
+    ComposeResult = Iterable
 
 DB_FILE = "bluray_backup.db"
 
