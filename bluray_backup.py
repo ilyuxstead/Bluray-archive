@@ -116,6 +116,15 @@ class Database:
         conn.close()
         return disk
     
+    def get_disk_by_label(self, label: str) -> Optional[Tuple]:
+        """Get a specific disk by label"""
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("SELECT id, label, capacity_gb, used_gb, created_date, notes FROM disks WHERE label = ?", (label,))
+        disk = c.fetchone()
+        conn.close()
+        return disk
+    
     def add_file(self, disk_id: int, file_path: str, disk_path: str, file_size_gb: float) -> Tuple[bool, str]:
         """Add a file record to the database"""
         if not file_path or not file_path.strip():
@@ -434,10 +443,20 @@ class TestDatabase(unittest.TestCase):
         self.assertIn("TEST-002", labels)
     
     def test_get_disk_by_id(self):
-        """Test retrieving a specific disk"""
+        """Test retrieving a specific disk by ID"""
         _, _, disk_id = self.db.add_disk("TEST-001", 25, "Notes")
         
         disk = self.db.get_disk_by_id(disk_id)
+        
+        self.assertIsNotNone(disk)
+        self.assertEqual(disk[1], "TEST-001")
+        self.assertEqual(disk[2], 25)
+    
+    def test_get_disk_by_label(self):
+        """Test retrieving a specific disk by label"""
+        self.db.add_disk("TEST-001", 25, "Notes")
+        
+        disk = self.db.get_disk_by_label("TEST-001")
         
         self.assertIsNotNone(disk)
         self.assertEqual(disk[1], "TEST-001")
@@ -718,6 +737,8 @@ class TestBurnEngine(unittest.TestCase):
 # ============================================================================
 
 class SearchScreen(Screen):
+    """Screen for searching backed up files"""
+    
     BINDINGS = [("escape", "app.pop_screen", "Cancel")]
     
     def compose(self) -> ComposeResult:
@@ -734,36 +755,42 @@ class SearchScreen(Screen):
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "search":
-            search_term = self.query_one("#search_term", Input).value
-            
-            if not search_term:
-                self.notify("Please enter a search term!", severity="warning")
-                return
-            
-            db = Database()
-            results = db.search_files(search_term)
-            
-            table = self.query_one("#search_results", DataTable)
-            table.clear()
-            
-            if not table.columns:
-                table.add_columns("Original Path", "Path on Disc", "Size (GB)", "Backup Date", "Disk Label")
-            
-            if results:
-                for filepath, disk_path, size, date, disk_label in results:
-                    table.add_row(filepath, disk_path, f"{size:.2f}", date, disk_label)
-                # Refresh to ensure table is rendered before notification
-                self.refresh()
-                self.notify(f"Found {len(results)} file(s)", severity="information")
-            else:
-                self.notify("No files found", severity="warning")
+            self.perform_search()
     
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "search_term":
-            self.query_one("#search", Button).press()
+            self.perform_search()
+    
+    def perform_search(self) -> None:
+        """Execute the search and display results"""
+        search_term = self.query_one("#search_term", Input).value
+        
+        if not search_term:
+            self.notify("Please enter a search term!", severity="warning")
+            return
+        
+        db = Database()
+        results = db.search_files(search_term)
+        
+        table = self.query_one("#search_results", DataTable)
+        table.clear()
+        
+        if not table.columns:
+            table.add_columns("Original Path", "Path on Disc", "Size (GB)", "Backup Date", "Disk Label")
+        
+        if results:
+            for filepath, disk_path, size, date, disk_label in results:
+                table.add_row(filepath, disk_path, f"{size:.2f}", date, disk_label)
+            # Force refresh to ensure table is rendered
+            self.refresh()
+            self.notify(f"Found {len(results)} file(s)", severity="information")
+        else:
+            self.notify("No files found", severity="warning")
 
 
 class AddToQueueScreen(Screen):
+    """Screen for adding files/directories to burn queue"""
+    
     BINDINGS = [("escape", "app.pop_screen", "Cancel")]
     
     def compose(self) -> ComposeResult:
@@ -783,36 +810,41 @@ class AddToQueueScreen(Screen):
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "add":
-            filepath = self.query_one("#filepath", Input).value
-            
-            if not filepath:
-                self.query_one("#message", Label).update("Path is required!")
-                return
-            
-            path = Path(filepath)
-            if not path.exists():
-                self.query_one("#message", Label).update("Path does not exist!")
-                return
-            
-            try:
-                size_gb = FileSystemHelper.calculate_size(path)
-                
-                db = Database()
-                success, msg = db.add_to_queue(str(path.absolute()), round(size_gb, 2))
-                
-                if success:
-                    self.notify(f"Added to queue: {size_gb:.2f} GB", severity="information")
-                    self.app.pop_screen()
-                else:
-                    self.query_one("#message", Label).update(msg)
-            except Exception as e:
-                self.query_one("#message", Label).update(f"Error: {str(e)}")
-        
+            self.add_to_queue()
         elif event.button.id == "cancel":
             self.app.pop_screen()
+    
+    def add_to_queue(self) -> None:
+        """Add the specified path to the burn queue"""
+        filepath = self.query_one("#filepath", Input).value
+        
+        if not filepath:
+            self.query_one("#message", Label).update("Path is required!")
+            return
+        
+        path = Path(filepath)
+        if not path.exists():
+            self.query_one("#message", Label).update("Path does not exist!")
+            return
+        
+        try:
+            size_gb = FileSystemHelper.calculate_size(path)
+            
+            db = Database()
+            success, msg = db.add_to_queue(str(path.absolute()), round(size_gb, 2))
+            
+            if success:
+                self.notify(f"Added to queue: {size_gb:.2f} GB", severity="information")
+                self.app.pop_screen()
+            else:
+                self.query_one("#message", Label).update(msg)
+        except Exception as e:
+            self.query_one("#message", Label).update(f"Error: {str(e)}")
 
 
 class BurnScreen(Screen):
+    """Screen for burning queue to disc with multi-session support"""
+    
     BINDINGS = [("escape", "app.pop_screen", "Cancel")]
     
     def __init__(self, queue_items: List[Tuple]):
@@ -844,7 +876,7 @@ class BurnScreen(Screen):
         yield Footer()
     
     def on_mount(self) -> None:
-        # Populate disk selector with existing disks
+        """Populate disk selector table with existing disks"""
         table = self.query_one("#disk_selector", DataTable)
         table.cursor_type = "row"
         table.add_columns("Label", "Used", "Free", "Capacity")
@@ -864,41 +896,18 @@ class BurnScreen(Screen):
                     f"{capacity} GB"
                 )
         else:
-            # Show message if no disks exist
             self.query_one("#status", Label).update("No existing disks - create a new one below")
     
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        # Only handle events from the disk_selector table
+        """Handle disk selection from table"""
         if event.data_table.id == "disk_selector":
             table = self.query_one("#disk_selector", DataTable)
             row = table.get_row_at(event.cursor_row)
-            self.selected_disk_label = row[0]  # First column is the label
+            self.selected_disk_label = row[0]
             
             # Auto-fill the label input
             self.query_one("#label", Input).value = self.selected_disk_label
             self.query_one("#status", Label).update(f"Selected existing disk: {self.selected_disk_label}")
-    
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        # Check which table triggered the event
-        if event.data_table.id == "disk_selector":
-            # Burn screen disk selector
-            table = self.query_one("#disk_selector", DataTable)
-            row = table.get_row_at(event.cursor_row)
-            self.selected_disk_label = row[0]  # First column is the label
-            
-            # Auto-fill the label input
-            self.query_one("#label", Input).value = self.selected_disk_label
-            self.query_one("#status", Label).update(f"Selected existing disk: {self.selected_disk_label}")
-        elif event.data_table.id == "disks_table":
-            # Main screen disk table
-            table = self.query_one("#disks_table", DataTable)
-            row = table.get_row_at(event.cursor_row)
-            self.selected_disk = (int(row[0]), row[1])
-            
-            info = self.query_one("#info", Container)
-            info.query_one(Label).update(
-                f"Selected: {row[1]} | Capacity: {row[2]}GB | Used: {row[3]}GB | Free: {row[4]}"
-            )
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "burn":
@@ -906,9 +915,10 @@ class BurnScreen(Screen):
         elif event.button.id == "cancel":
             self.app.pop_screen()
     
-    def start_burn(self):
-        label = self.query_one("#label", Input).value
-        capacity = self.query_one("#capacity", Input).value
+    def start_burn(self) -> None:
+        """Validate inputs and start the burn process"""
+        label = self.query_one("#label", Input).value.strip()
+        capacity = self.query_one("#capacity", Input).value.strip()
         
         if not label:
             self.query_one("#message", Label).update("Label is required!")
@@ -917,15 +927,10 @@ class BurnScreen(Screen):
         db = Database()
         
         # Check if disk already exists
-        existing_disks = db.get_disks()
-        existing_disk = None
-        for disk in existing_disks:
-            if disk[1] == label:  # disk[1] is the label
-                existing_disk = disk
-                break
+        existing_disk = db.get_disk_by_label(label)
         
         if existing_disk:
-            # Use existing disk
+            # Use existing disk - check available space
             disk_id = existing_disk[0]
             capacity_gb = existing_disk[2]
             used_gb = existing_disk[3]
@@ -965,6 +970,7 @@ class BurnScreen(Screen):
             
             self.query_one("#status", Label).update(f"Creating new disk: {label}")
         
+        # Detect burning hardware
         tool, device = BurnEngine.detect_burner()
         
         if not tool:
@@ -974,9 +980,10 @@ class BurnScreen(Screen):
             return
         
         self.query_one("#status", Label).update(f"Using {tool} on {device}")
-        self.perform_burn(disk_id, label, device, tool, sum(item[2] for item in self.queue_items))
+        self.perform_burn(disk_id, label, device, tool)
     
-    def perform_burn(self, disk_id: int, label: str, device: str, tool: str, total_size: float):
+    def perform_burn(self, disk_id: int, label: str, device: str, tool: str) -> None:
+        """Execute the burn process and record files in database"""
         db = Database()
         progress = self.query_one("#progress", ProgressBar)
         status = self.query_one("#status", Label)
@@ -1004,7 +1011,7 @@ class BurnScreen(Screen):
             progress.update(progress=80)
             status.update("Recording files in database...")
             
-            # Record all files in database
+            # Record all files individually in database
             for item in self.queue_items:
                 queue_id, filepath, size, _ = item
                 source_path = Path(filepath)
@@ -1014,14 +1021,12 @@ class BurnScreen(Screen):
                     disk_path = file_map.get(filepath, source_path.name)
                     db.add_file(disk_id, filepath, disk_path, size)
                 else:
-                    # Directory - add each file individually
+                    # Directory - add each file individually for searchability
                     base_disk_path = file_map.get(filepath, source_path.name)
                     for file in source_path.rglob('*'):
                         if file.is_file():
                             file_size_gb = file.stat().st_size / (1024**3)
-                            # Calculate relative path from source directory
                             rel_path = file.relative_to(source_path)
-                            # Combine with base disk path
                             file_disk_path = str(Path(base_disk_path) / rel_path)
                             db.add_file(disk_id, str(file), file_disk_path, file_size_gb)
             
@@ -1042,6 +1047,8 @@ class BurnScreen(Screen):
 
 
 class AddDiskScreen(Screen):
+    """Screen for manually adding a disk to the database"""
+    
     BINDINGS = [("escape", "app.pop_screen", "Cancel")]
     
     def compose(self) -> ComposeResult:
@@ -1065,31 +1072,36 @@ class AddDiskScreen(Screen):
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "add":
-            label = self.query_one("#label", Input).value
-            capacity = self.query_one("#capacity", Input).value
-            notes = self.query_one("#notes", Input).value
-            
-            if not label or not capacity:
-                self.query_one("#message", Label).update("Label and capacity are required!")
-                return
-            
-            try:
-                capacity_gb = int(capacity)
-                db = Database()
-                success, msg, _ = db.add_disk(label, capacity_gb, notes)
-                
-                if success:
-                    self.app.pop_screen()
-                else:
-                    self.query_one("#message", Label).update(msg)
-            except ValueError:
-                self.query_one("#message", Label).update("Capacity must be a number!")
-        
+            self.add_disk()
         elif event.button.id == "cancel":
             self.app.pop_screen()
+    
+    def add_disk(self) -> None:
+        """Add a new disk to the database"""
+        label = self.query_one("#label", Input).value
+        capacity = self.query_one("#capacity", Input).value
+        notes = self.query_one("#notes", Input).value
+        
+        if not label or not capacity:
+            self.query_one("#message", Label).update("Label and capacity are required!")
+            return
+        
+        try:
+            capacity_gb = int(capacity)
+            db = Database()
+            success, msg, _ = db.add_disk(label, capacity_gb, notes)
+            
+            if success:
+                self.app.pop_screen()
+            else:
+                self.query_one("#message", Label).update(msg)
+        except ValueError:
+            self.query_one("#message", Label).update("Capacity must be a number!")
 
 
 class QueueScreen(Screen):
+    """Screen for managing the burn queue"""
+    
     BINDINGS = [("escape", "app.pop_screen", "Back")]
     
     def compose(self) -> ComposeResult:
@@ -1113,7 +1125,8 @@ class QueueScreen(Screen):
         table.add_columns("ID", "File Path", "Size (GB)", "Added")
         self.refresh_queue()
     
-    def refresh_queue(self):
+    def refresh_queue(self) -> None:
+        """Refresh the queue table display"""
         db = Database()
         queue = db.get_queue()
         table = self.query_one("#queue_table", DataTable)
@@ -1158,6 +1171,8 @@ class QueueScreen(Screen):
 
 
 class BlurayBackupApp(App):
+    """Main application"""
+    
     CSS = """
     Screen {
         background: $surface;
@@ -1294,7 +1309,8 @@ class BlurayBackupApp(App):
         table.add_columns("ID", "Label", "Capacity (GB)", "Used (GB)", "Free (%)", "Created", "Notes")
         self.refresh_table()
     
-    def refresh_table(self):
+    def refresh_table(self) -> None:
+        """Refresh the main disk table"""
         table = self.query_one("#disks_table", DataTable)
         table.clear()
         
@@ -1323,6 +1339,7 @@ class BlurayBackupApp(App):
             self.refresh_table()
     
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Handle row selection in main disk table"""
         if event.data_table.id == "disks_table":
             table = self.query_one("#disks_table", DataTable)
             row = table.get_row_at(event.cursor_row)
