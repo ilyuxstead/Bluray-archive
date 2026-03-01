@@ -868,13 +868,37 @@ class BurnScreen(Screen):
             self.query_one("#status", Label).update("No existing disks - create a new one below")
     
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        table = self.query_one("#disk_selector", DataTable)
-        row = table.get_row(event.row_key)
-        self.selected_disk_label = row[0]  # First column is the label
-        
-        # Auto-fill the label input
-        self.query_one("#label", Input).value = self.selected_disk_label
-        self.query_one("#status", Label).update(f"Selected existing disk: {self.selected_disk_label}")
+        # Only handle events from the disk_selector table
+        if event.data_table.id == "disk_selector":
+            table = self.query_one("#disk_selector", DataTable)
+            row = table.get_row_at(event.cursor_row)
+            self.selected_disk_label = row[0]  # First column is the label
+            
+            # Auto-fill the label input
+            self.query_one("#label", Input).value = self.selected_disk_label
+            self.query_one("#status", Label).update(f"Selected existing disk: {self.selected_disk_label}")
+    
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        # Check which table triggered the event
+        if event.data_table.id == "disk_selector":
+            # Burn screen disk selector
+            table = self.query_one("#disk_selector", DataTable)
+            row = table.get_row_at(event.cursor_row)
+            self.selected_disk_label = row[0]  # First column is the label
+            
+            # Auto-fill the label input
+            self.query_one("#label", Input).value = self.selected_disk_label
+            self.query_one("#status", Label).update(f"Selected existing disk: {self.selected_disk_label}")
+        elif event.data_table.id == "disks_table":
+            # Main screen disk table
+            table = self.query_one("#disks_table", DataTable)
+            row = table.get_row_at(event.cursor_row)
+            self.selected_disk = (int(row[0]), row[1])
+            
+            info = self.query_one("#info", Container)
+            info.query_one(Label).update(
+                f"Selected: {row[1]} | Capacity: {row[2]}GB | Used: {row[3]}GB | Free: {row[4]}"
+            )
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "burn":
@@ -1149,12 +1173,17 @@ class BlurayBackupApp(App):
     }
     
     #burn_dialog {
-        width: 70;
+        width: 80;
         height: auto;
         border: thick $background 80%;
         background: $surface;
         padding: 1 2;
         margin: 2 4;
+    }
+    
+    #disk_selector {
+        height: 10;
+        margin: 1 0;
     }
     
     #queue_container {
@@ -1294,14 +1323,15 @@ class BlurayBackupApp(App):
             self.refresh_table()
     
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        table = self.query_one("#disks_table", DataTable)
-        row = table.get_row(event.row_key)
-        self.selected_disk = (int(row[0]), row[1])
-        
-        info = self.query_one("#info", Container)
-        info.query_one(Label).update(
-            f"Selected: {row[1]} | Capacity: {row[2]}GB | Used: {row[3]}GB | Free: {row[4]}"
-        )
+        if event.data_table.id == "disks_table":
+            table = self.query_one("#disks_table", DataTable)
+            row = table.get_row_at(event.cursor_row)
+            self.selected_disk = (int(row[0]), row[1])
+            
+            info = self.query_one("#info", Container)
+            info.query_one(Label).update(
+                f"Selected: {row[1]} | Capacity: {row[2]}GB | Used: {row[3]}GB | Free: {row[4]}"
+            )
     
     def action_add_disk(self) -> None:
         self.push_screen(AddDiskScreen())
