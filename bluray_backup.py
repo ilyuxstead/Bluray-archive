@@ -752,6 +752,8 @@ class SearchScreen(Screen):
             if results:
                 for filepath, disk_path, size, date, disk_label in results:
                     table.add_row(filepath, disk_path, f"{size:.2f}", date, disk_label)
+                # Refresh to ensure table is rendered before notification
+                self.refresh()
                 self.notify(f"Found {len(results)} file(s)", severity="information")
             else:
                 self.notify("No files found", severity="warning")
@@ -816,17 +818,20 @@ class BurnScreen(Screen):
     def __init__(self, queue_items: List[Tuple]):
         super().__init__()
         self.queue_items = queue_items
+        self.selected_disk_label = None
     
     def compose(self) -> ComposeResult:
         yield Header()
         yield Container(
             Label("Burn Queue to Disc", id="title"),
-            Label("Disk Label:"),
+            Label("Select existing disk or enter new label:"),
+            DataTable(id="disk_selector"),
+            Label("Or enter disk label manually:"),
             Input(placeholder="e.g., BACKUP-2024-001", id="label"),
-            Label("Capacity (GB):"),
+            Label("Capacity (GB) - only for new disks:"),
             Input(placeholder="25, 50, or 100", id="capacity", value="25"),
             Label(f"Queue size: {sum(item[2] for item in self.queue_items):.2f} GB"),
-            Label("Files will be burned as raw files with UDF filesystem"),
+            Label("Multi-session: You can add to existing disks until full"),
             Label("Status:", id="status"),
             ProgressBar(total=100, show_eta=False, id="progress"),
             Horizontal(
@@ -838,6 +843,39 @@ class BurnScreen(Screen):
         )
         yield Footer()
     
+    def on_mount(self) -> None:
+        # Populate disk selector with existing disks
+        table = self.query_one("#disk_selector", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("Label", "Used", "Free", "Capacity")
+        
+        db = Database()
+        disks = db.get_disks()
+        
+        if disks:
+            for disk in disks:
+                disk_id, label, capacity, used, created, notes = disk
+                free = capacity - used
+                free_pct = round((free / capacity) * 100, 1) if capacity > 0 else 0
+                table.add_row(
+                    label,
+                    f"{used:.1f} GB",
+                    f"{free:.1f} GB ({free_pct}%)",
+                    f"{capacity} GB"
+                )
+        else:
+            # Show message if no disks exist
+            self.query_one("#status", Label).update("No existing disks - create a new one below")
+    
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        table = self.query_one("#disk_selector", DataTable)
+        row = table.get_row(event.row_key)
+        self.selected_disk_label = row[0]  # First column is the label
+        
+        # Auto-fill the label input
+        self.query_one("#label", Input).value = self.selected_disk_label
+        self.query_one("#status", Label).update(f"Selected existing disk: {self.selected_disk_label}")
+    
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "burn":
             self.start_burn()
@@ -848,20 +886,60 @@ class BurnScreen(Screen):
         label = self.query_one("#label", Input).value
         capacity = self.query_one("#capacity", Input).value
         
-        if not label or not capacity:
-            self.query_one("#message", Label).update("Label and capacity are required!")
+        if not label:
+            self.query_one("#message", Label).update("Label is required!")
             return
         
-        try:
-            capacity_gb = int(capacity)
-        except ValueError:
-            self.query_one("#message", Label).update("Capacity must be a number!")
-            return
+        db = Database()
         
-        total_size = sum(item[2] for item in self.queue_items)
-        if total_size > capacity_gb:
-            self.query_one("#message", Label).update(f"Queue too large! {total_size:.2f} GB > {capacity_gb} GB")
-            return
+        # Check if disk already exists
+        existing_disks = db.get_disks()
+        existing_disk = None
+        for disk in existing_disks:
+            if disk[1] == label:  # disk[1] is the label
+                existing_disk = disk
+                break
+        
+        if existing_disk:
+            # Use existing disk
+            disk_id = existing_disk[0]
+            capacity_gb = existing_disk[2]
+            used_gb = existing_disk[3]
+            
+            total_size = sum(item[2] for item in self.queue_items)
+            available_space = capacity_gb - used_gb
+            
+            if total_size > available_space:
+                self.query_one("#message", Label).update(
+                    f"Not enough space! Need {total_size:.2f} GB, only {available_space:.2f} GB available"
+                )
+                return
+            
+            self.query_one("#status", Label).update(f"Appending to existing disk: {label}")
+        else:
+            # Create new disk
+            if not capacity:
+                self.query_one("#message", Label).update("Capacity is required for new disks!")
+                return
+            
+            try:
+                capacity_gb = int(capacity)
+            except ValueError:
+                self.query_one("#message", Label).update("Capacity must be a number!")
+                return
+            
+            total_size = sum(item[2] for item in self.queue_items)
+            if total_size > capacity_gb:
+                self.query_one("#message", Label).update(f"Queue too large! {total_size:.2f} GB > {capacity_gb} GB")
+                return
+            
+            success, msg, disk_id = db.add_disk(label, capacity_gb, "Burned with UDF filesystem")
+            
+            if not success:
+                self.query_one("#message", Label).update(msg)
+                return
+            
+            self.query_one("#status", Label).update(f"Creating new disk: {label}")
         
         tool, device = BurnEngine.detect_burner()
         
@@ -871,15 +949,8 @@ class BurnScreen(Screen):
             )
             return
         
-        db = Database()
-        success, msg, disk_id = db.add_disk(label, capacity_gb, "Burned with UDF filesystem")
-        
-        if not success:
-            self.query_one("#message", Label).update(msg)
-            return
-        
         self.query_one("#status", Label).update(f"Using {tool} on {device}")
-        self.perform_burn(disk_id, label, device, tool, total_size)
+        self.perform_burn(disk_id, label, device, tool, sum(item[2] for item in self.queue_items))
     
     def perform_burn(self, disk_id: int, label: str, device: str, tool: str, total_size: float):
         db = Database()
@@ -909,10 +980,26 @@ class BurnScreen(Screen):
             progress.update(progress=80)
             status.update("Recording files in database...")
             
+            # Record all files in database
             for item in self.queue_items:
                 queue_id, filepath, size, _ = item
-                disk_path = file_map.get(filepath, Path(filepath).name)
-                db.add_file(disk_id, filepath, disk_path, size)
+                source_path = Path(filepath)
+                
+                if source_path.is_file():
+                    # Single file - add it directly
+                    disk_path = file_map.get(filepath, source_path.name)
+                    db.add_file(disk_id, filepath, disk_path, size)
+                else:
+                    # Directory - add each file individually
+                    base_disk_path = file_map.get(filepath, source_path.name)
+                    for file in source_path.rglob('*'):
+                        if file.is_file():
+                            file_size_gb = file.stat().st_size / (1024**3)
+                            # Calculate relative path from source directory
+                            rel_path = file.relative_to(source_path)
+                            # Combine with base disk path
+                            file_disk_path = str(Path(base_disk_path) / rel_path)
+                            db.add_file(disk_id, str(file), file_disk_path, file_size_gb)
             
             db.clear_queue()
             
