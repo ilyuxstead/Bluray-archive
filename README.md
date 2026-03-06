@@ -3,7 +3,7 @@
 A Terminal User Interface (TUI) application for managing and cataloging file backups to Blu-ray discs with multi-session support, searchable database, and UDF filesystem burning.
 
 ![Python Version](https://img.shields.io/badge/python-3.7+-blue.svg)
-![License](https://img.shields.io/badge/license-MIT-green.svg)
+![License](https://img.shields.io/badge/license-MPL_2.0-green.svg)
 ![Tests](https://img.shields.io/badge/tests-34%20passing-brightgreen.svg)
 
 ## Features
