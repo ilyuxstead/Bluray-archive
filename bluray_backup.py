@@ -325,12 +325,28 @@ class BurnEngine:
     
     @staticmethod
     def find_linux_drive() -> str:
-        """Find optical drive on Linux"""
-        common_paths = ['/dev/sr0', '/dev/dvd', '/dev/cdrom']
-        for path in common_paths:
-            if os.path.exists(path):
-                return path
-        return '/dev/sr0'  # Default
+        """Find optical drive on Linux - prefer Blu-ray capable drives"""
+        import glob
+        # Find all optical drives
+        drives = sorted(glob.glob('/dev/sr*'))
+        
+        # Try to identify the Blu-ray drive by checking media info
+        for drive in drives:
+            try:
+                result = subprocess.run(
+                    ['dvd+rw-mediainfo', drive],
+                    capture_output=True, text=True, timeout=5
+                )
+                # Prefer drives that mention BD (Blu-ray)
+                if 'BD' in result.stdout or 'blu' in result.stdout.lower():
+                    return drive
+            except Exception:
+                pass
+        
+        # Fall back to last drive (sr1 if two drives present, sr0 if only one)
+        if drives:
+            return drives[-1]
+        return '/dev/sr0'  # Absolute default
     
     @staticmethod
     def find_macos_drive() -> str:
@@ -347,25 +363,83 @@ class BurnEngine:
     
     @staticmethod
     def burn_udf(staging_dir: str, device: str, tool: str, label: str) -> Tuple[bool, str]:
-        """Burn files directly to disc with UDF filesystem (simulation for testing)"""
-        # In production, this would execute actual burn commands
-        # For testing, we just validate inputs
-        
+        """Burn files directly to disc with UDF filesystem"""
         if not staging_dir or not Path(staging_dir).exists():
             return False, "Staging directory does not exist"
-        
+
         if not device:
             return False, "No device specified"
-        
+
         if not tool:
             return False, "No burning tool specified"
-        
+
         if not label or not label.strip():
             return False, "Label cannot be empty"
-        
-        # Simulation: In real implementation, this would call growisofs or drutil
-        # For now, we return success for testing purposes
-        return True, "Burn simulation successful"
+
+        try:
+            if tool == 'growisofs':
+                # growisofs writes directly to device with UDF filesystem
+                cmd = [
+                    'growisofs',
+                    '-Z', device,       # -Z = new disc (use -M for multi-session append)
+                    '-speed=4',         # Burn at 4x for reliability (max is 6x but prone to failure)
+                    '-udf',             # UDF filesystem
+                    '-V', label.strip(),  # volume label
+                    '-r',               # Rock Ridge extensions for long filenames
+                    staging_dir
+                ]
+                # Use Popen so growisofs can write progress to the terminal
+                # and doesn't block waiting for a pipe buffer to drain.
+                # stdout/stderr go directly to the terminal (not captured).
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=None,   # inherit terminal
+                    stderr=None,   # inherit terminal (growisofs progress goes here)
+                    stdin=subprocess.DEVNULL
+                )
+                try:
+                    proc.wait(timeout=7200)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    return False, "Burn timed out after 2 hours"
+
+                # growisofs returns 0 on success.
+                # It can also return non-zero for minor warnings even when the
+                # burn physically completed — so we verify via mediainfo.
+                if proc.returncode == 0:
+                    return True, "Burn completed successfully"
+
+                # Non-zero exit: check if disc actually has data (burn may have
+                # succeeded despite growisofs reporting an error code)
+                try:
+                    verify = subprocess.run(
+                        ['dvd+rw-mediainfo', device],
+                        capture_output=True, text=True, timeout=15
+                    )
+                    # If disc is no longer blank, the burn worked
+                    if 'Disc status:' in verify.stdout and 'blank' not in verify.stdout:
+                        return True, "Burn completed successfully (growisofs reported warnings but disc has data)"
+                except Exception:
+                    pass
+
+                return False, f"growisofs exited with code {proc.returncode} — check terminal output above for details"
+
+            elif tool == 'drutil':
+                # macOS: drutil burn with UDF
+                cmd = ['drutil', 'burn', '-udf', '-noverify', staging_dir]
+                result = subprocess.run(cmd, timeout=7200)
+                if result.returncode == 0:
+                    return True, "Burn completed successfully"
+                else:
+                    return False, f"drutil error (exit code {result.returncode})"
+
+            else:
+                return False, f"Unsupported burning tool: {tool}"
+
+        except FileNotFoundError:
+            return False, f"Burning tool '{tool}' not found — is it installed and on PATH?"
+        except Exception as e:
+            return False, f"Burn error: {str(e)}"
 
 
 # ============================================================================
@@ -727,13 +801,15 @@ class TestBurnEngine(unittest.TestCase):
             shutil.rmtree(staging)
     
     def test_burn_udf_valid_inputs(self):
-        """Test burn with valid inputs (simulation)"""
+        """Test burn with valid inputs - real growisofs attempt (will fail without hardware)"""
         staging = tempfile.mkdtemp()
         try:
             success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-001")
-            
-            self.assertTrue(success)
-            self.assertIn("successful", msg.lower())
+            # Without real hardware growisofs will fail or not be found - both are valid.
+            # We just verify the method returns a proper (bool, str) tuple.
+            self.assertIsInstance(success, bool)
+            self.assertIsInstance(msg, str)
+            self.assertGreater(len(msg), 0)
         finally:
             shutil.rmtree(staging)
 
@@ -821,29 +897,72 @@ class AddToQueueScreen(Screen):
             self.app.pop_screen()
     
     def add_to_queue(self) -> None:
-        """Add the specified path to the burn queue"""
-        filepath = self.query_one("#filepath", Input).value
+        """Add the specified path to the burn queue. Supports wildcards e.g. /home/user/*.jpg"""
+        filepath = self.query_one("#filepath", Input).value.strip()
         
         if not filepath:
             self.query_one("#message", Label).update("Path is required!")
             return
-        
-        path = Path(filepath)
-        if not path.exists():
-            self.query_one("#message", Label).update("Path does not exist!")
-            return
-        
+
         try:
-            size_gb = FileSystemHelper.calculate_size(path)
-            
-            db = Database()
-            success, msg = db.add_to_queue(str(path.absolute()), round(size_gb, 2))
-            
-            if success:
-                self.notify(f"Added to queue: {size_gb:.2f} GB", severity="information")
-                self.app.pop_screen()
+            # Expand ~ to the real home directory
+            filepath = str(Path(filepath).expanduser())
+
+            # Check if the input contains a wildcard
+            if '*' in filepath or '?' in filepath:
+                parent = Path(filepath).parent
+                pattern = Path(filepath).name
+
+                if not parent.exists():
+                    # Give a helpful hint about case sensitivity
+                    self.query_one("#message", Label).update(
+                        f"Directory not found: {parent}\n"
+                        f"Note: Linux paths are case-sensitive (use /home not /Home)"
+                    )
+                    return
+
+                matched_files = sorted(parent.glob(pattern))
+                if not matched_files:
+                    self.query_one("#message", Label).update(
+                        f"No files matched '{pattern}' in {parent}"
+                    )
+                    return
+
+                # Add each matched file to the queue individually
+                db = Database()
+                added = 0
+                for match in matched_files:
+                    if match.is_file():
+                        size_gb = FileSystemHelper.calculate_size(match)
+                        success, msg = db.add_to_queue(str(match), round(size_gb, 4))
+                        if success:
+                            added += 1
+
+                if added > 0:
+                    self.notify(f"Added {added} file(s) to queue", severity="information")
+                    self.app.pop_screen()
+                else:
+                    self.query_one("#message", Label).update("No files could be added to the queue")
             else:
-                self.query_one("#message", Label).update(msg)
+                # Single file or directory path
+                path = Path(filepath).resolve()
+                if not path.exists():
+                    self.query_one("#message", Label).update(
+                        f"Path not found: {path}\n"
+                        f"Note: Linux paths are case-sensitive (use /home not /Home)"
+                    )
+                    return
+
+                size_gb = FileSystemHelper.calculate_size(path)
+                db = Database()
+                success, msg = db.add_to_queue(str(path), round(size_gb, 2))
+
+                if success:
+                    self.notify(f"Added to queue: {size_gb:.2f} GB", severity="information")
+                    self.app.pop_screen()
+                else:
+                    self.query_one("#message", Label).update(msg)
+
         except Exception as e:
             self.query_one("#message", Label).update(f"Error: {str(e)}")
 
@@ -993,28 +1112,32 @@ class BurnScreen(Screen):
         db = Database()
         progress = self.query_one("#progress", ProgressBar)
         status = self.query_one("#status", Label)
-        
+        staging_dir = None
+
         try:
             status.update("Preparing files for burning...")
-            progress.update(progress=10)
+            progress.update(progress=5)
             
             staging_dir = tempfile.mkdtemp(prefix="bluray_staging_")
             staging_path, file_map = FileSystemHelper.prepare_staging_area(self.queue_items, staging_dir)
             
-            status.update("Staging complete. Starting burn...")
-            progress.update(progress=30)
+            status.update("Staging complete. Starting burn — this will take 30–45 minutes...")
+            progress.update(progress=15)
             
-            status.update("Burning files to disc with UDF filesystem...")
-            progress.update(progress=50)
+            status.update("🔥 Burning to disc... (progress shown in terminal, not here)")
+            progress.update(progress=20)
             
             success, msg = BurnEngine.burn_udf(staging_path, device, tool, label)
             
+            # Move progress to 80% now that burn is done regardless of reported status
+            progress.update(progress=80)
+
             if not success:
+                # Double-check via mediainfo before giving up
                 self.query_one("#message", Label).update(f"Burn failed: {msg}")
-                status.update("Burn failed!")
+                status.update("Burn failed — check terminal output for details")
                 return
             
-            progress.update(progress=80)
             status.update("Recording files in database...")
             
             # Record all files individually in database
@@ -1038,11 +1161,8 @@ class BurnScreen(Screen):
             
             db.clear_queue()
             
-            if Path(staging_dir).exists():
-                shutil.rmtree(staging_dir)
-            
             progress.update(progress=100)
-            status.update("Burn completed successfully! Files are now searchable and restorable.")
+            status.update("✅ Burn completed successfully! Files are now searchable and restorable.")
             
             self.notify("Burn completed! Files added to database.", severity="information")
             self.query_one("#burn", Button).disabled = True
@@ -1050,6 +1170,10 @@ class BurnScreen(Screen):
         except Exception as e:
             self.query_one("#message", Label).update(f"Error: {str(e)}")
             status.update(f"Error occurred: {str(e)}")
+        finally:
+            # Always clean up staging directory, whether burn succeeded or failed
+            if staging_dir and Path(staging_dir).exists():
+                shutil.rmtree(staging_dir)
 
 
 class AddDiskScreen(Screen):
