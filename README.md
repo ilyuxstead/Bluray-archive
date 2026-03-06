@@ -9,24 +9,28 @@ A Terminal User Interface (TUI) application for managing and cataloging file bac
 ## Features
 
 ### 📀 Multi-Session Burning
+
 - Append files to existing discs until full
 - Automatic space tracking and validation
 - Support for 25GB, 50GB, and 100GB Blu-ray discs
 - Queue system to stage files before burning
 
 ### 🔍 Searchable Database
+
 - SQLite database tracks every file
 - Search by filename or path
 - See exactly which disc contains any file
 - Individual file tracking even for directories
 
 ### 💾 UDF Filesystem
+
 - Files burned as raw files (not ISO)
 - No extraction needed - browse like a USB drive
 - Compatible with Windows, macOS, and Linux
 - Direct file restoration
 
 ### 🎯 Clean Architecture
+
 - Separation of business logic and UI
 - Comprehensive unit tests (34 tests)
 - Type hints throughout
@@ -37,16 +41,19 @@ A Terminal User Interface (TUI) application for managing and cataloging file bac
 ### Requirements
 
 **Python Requirements:**
+
 - Python 3.7 or higher
 - [Textual](https://github.com/Textualize/textual) TUI library
 
 **Burning Tools (Optional - for actual burning):**
+
 - **Linux:** `growisofs` and `mkisofs`/`genisoimage`
 - **macOS:** Built-in tools (hdiutil/drutil)
 
 ### Quick Install
 
 **Using pip (recommended):**
+
 ```bash
 # Using pipx (isolated environment)
 sudo apt install pipx  # or brew install pipx on macOS
@@ -61,12 +68,14 @@ python3 bluray_backup.py
 ```
 
 **Using system packages (Ubuntu/Debian):**
+
 ```bash
 sudo apt install python3-textual
 python3 bluray_backup.py
 ```
 
 **Install burning tools (Linux):**
+
 ```bash
 sudo apt install growisofs genisoimage
 ```
@@ -89,44 +98,50 @@ chmod +x bluray_backup.py
 
 ### Keyboard Shortcuts
 
-| Key | Action |
-|-----|--------|
-| `a` | Add a new disk manually |
-| `b` | Open burn queue |
-| `s` | Search for files |
-| `q` | Quit application |
-| `Esc` | Go back / Cancel |
+|Key  |Action                 |
+|-----|-----------------------|
+|`a`  |Add a new disk manually|
+|`b`  |Open burn queue        |
+|`s`  |Search for files       |
+|`q`  |Quit application       |
+|`Esc`|Go back / Cancel       |
 
 ### Workflow
 
 #### 1. Add Files to Queue
+
 1. Press `b` to open Burn Queue
-2. Click "Add Files" 
-3. Enter file or directory path
-4. Files are added with automatic size calculation
+1. Click “Add Files”
+1. Enter file or directory path
+1. Files are added with automatic size calculation
+
+> **Tip:** Wildcards are supported! Enter a pattern like `/home/user/photos/*.jpg` to queue multiple files at once. The `~` home directory shortcut is also expanded automatically.
 
 #### 2. Burn to Disc
-1. In Burn Queue, click "Burn to Disc"
-2. **Select existing disk** from the table (for multi-session)
-   - Or enter new disk label to create new disc
-3. Set capacity (25, 50, or 100 GB for new discs)
-4. Click "Start Burn"
-5. Files are burned and automatically cataloged
+
+1. In Burn Queue, click “Burn to Disc”
+1. **Select existing disk** from the table (for multi-session)
+- Or enter new disk label to create new disc
+1. Set capacity (25, 50, or 100 GB for new discs)
+1. Click “Start Burn”
+1. Files are burned and automatically cataloged
 
 #### 3. Search for Files
+
 1. Press `s` to open Search
-2. Enter filename or path fragment
-3. View results showing:
-   - Original file location
-   - Location on disc
-   - Which disc contains it
-   - Backup date and size
+1. Enter filename or path fragment
+1. View results showing:
+- Original file location
+- Location on disc
+- Which disc contains it
+- Backup date and size
 
 #### 4. Restore Files
+
 1. Search for the file you need
-2. Note which disc label contains it
-3. Insert that disc
-4. Copy files directly from the mounted disc
+1. Note which disc label contains it
+1. Insert that disc
+1. Copy files directly from the mounted disc
 
 ## Architecture
 
@@ -150,14 +165,17 @@ bluray_backup.py
 ### Database Schema
 
 **Disks Table:**
+
 - Tracks disc label, capacity, used space, creation date, notes
 
 **Files Table:**
+
 - Tracks original path, disc path, size, backup date
 - Foreign key to disks table
 - Indexed for fast searching
 
 **Burn Queue Table:**
+
 - Temporary staging area for files to burn
 
 ## Examples
@@ -212,6 +230,7 @@ python3 bluray_backup.py --test
 ```
 
 **Test Coverage:**
+
 - Database operations (17 tests)
 - File system operations (4 tests)
 - Burn engine operations (7 tests)
@@ -219,13 +238,14 @@ python3 bluray_backup.py --test
 
 ## Troubleshooting
 
-### "externally-managed-environment" error
+### “externally-managed-environment” error
 
 **Ubuntu/Debian users:** Use pipx or virtual environment (see Installation)
 
-### "No burning tool found"
+### “No burning tool found”
 
 **Linux:** Install growisofs
+
 ```bash
 sudo apt install growisofs genisoimage
 ```
@@ -239,9 +259,14 @@ Press `Esc` once to refresh, or upgrade to latest Textual version
 ### Cannot import ComposeResult
 
 You have an older Textual version. The code is compatible, but consider upgrading:
+
 ```bash
 pip install --upgrade textual
 ```
+
+### Burn is slow / taking 30–45 minutes
+
+This is expected. The app burns at 4x speed intentionally — higher speeds (up to 6x) are supported by the hardware but are prone to write errors and disc failures. Patience here means a reliable backup.
 
 ## Technical Details
 
@@ -250,7 +275,7 @@ pip install --upgrade textual
 - **Direct Access:** Browse files without extraction
 - **Multi-Session:** Append files to existing discs
 - **Compatibility:** Works on all major operating systems
-- **Simplicity:** Users understand "copy file from disc"
+- **Simplicity:** Users understand “copy file from disc”
 
 ### Why SQLite?
 
@@ -269,10 +294,10 @@ See the SQLite vs JSON vs MongoDB comparison in the docs - SQLite is ideal for t
 Contributions are welcome! Please:
 
 1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Ensure all tests pass
-5. Submit a pull request
+1. Create a feature branch
+1. Add tests for new functionality
+1. Ensure all tests pass
+1. Submit a pull request
 
 ## License
 
@@ -298,10 +323,11 @@ Potential future enhancements:
 ## Support
 
 For issues, questions, or suggestions:
+
 - Open an issue on GitHub
 - Include Python version and OS
 - Include output of `python3 bluray_backup.py --test`
 
----
+-----
 
 **Made with ❤️ for people who believe in physical backups**
