@@ -301,7 +301,7 @@ Contributions are welcome! Please:
 
 ## License
 
-MPT 2.0 License - See LICENSE file for details
+MPL 2.0 License - See LICENSE file for details
 
 ## Roadmap
 
