@@ -301,7 +301,7 @@ Contributions are welcome! Please:
 
 ## License
 
-MIT License - See LICENSE file for details
+MPT 2.0 License - See LICENSE file for details
 
 ## Roadmap
 
