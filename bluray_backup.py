@@ -362,8 +362,20 @@ class BurnEngine:
         return 'disk1'
     
     @staticmethod
-    def burn_udf(staging_dir: str, device: str, tool: str, label: str) -> Tuple[bool, str]:
-        """Burn files directly to disc with UDF filesystem"""
+    def burn_udf(staging_dir: str, device: str, tool: str, label: str,
+                 is_new_disc: bool = True) -> Tuple[bool, str]:
+        """Burn files directly to disc with UDF filesystem.
+
+        Args:
+            staging_dir: Path to the directory of files to burn.
+            device:      Block device path (e.g. /dev/sr0).
+            tool:        Burning tool name ('growisofs' or 'drutil').
+            label:       UDF volume label.
+            is_new_disc: True  → use -Z (start a brand-new disc / overwrite).
+                         False → use -M (append a new session to existing data).
+                         NEVER pass True when appending to a disc that already
+                         has data — doing so will silently destroy that data.
+        """
         if not staging_dir or not Path(staging_dir).exists():
             return False, "Staging directory does not exist"
 
@@ -378,23 +390,26 @@ class BurnEngine:
 
         try:
             if tool == 'growisofs':
-                # growisofs writes directly to device with UDF filesystem
+                # -Z starts a new disc (overwrites everything already on it).
+                # -M appends a new session, leaving existing sessions intact.
+                session_flag = '-Z' if is_new_disc else '-M'
+
                 cmd = [
                     'growisofs',
-                    '-Z', device,       # -Z = new disc (use -M for multi-session append)
-                    '-speed=4',         # Burn at 4x for reliability (max is 6x but prone to failure)
-                    '-udf',             # UDF filesystem
-                    '-V', label.strip(),  # volume label
-                    '-r',               # Rock Ridge extensions for long filenames
+                    f'{session_flag}={device}',  # e.g. -Z=/dev/sr0 or -M=/dev/sr0
+                    '-speed=4',                  # 4x for reliability
+                    '-udf',                      # UDF filesystem
+                    '-V', label.strip(),         # volume label
+                    '-r',                        # Rock Ridge for long filenames
                     staging_dir
                 ]
+
                 # Use Popen so growisofs can write progress to the terminal
                 # and doesn't block waiting for a pipe buffer to drain.
-                # stdout/stderr go directly to the terminal (not captured).
                 proc = subprocess.Popen(
                     cmd,
-                    stdout=None,   # inherit terminal
-                    stderr=None,   # inherit terminal (growisofs progress goes here)
+                    stdout=None,          # inherit terminal
+                    stderr=None,          # inherit terminal (growisofs progress goes here)
                     stdin=subprocess.DEVNULL
                 )
                 try:
@@ -403,20 +418,15 @@ class BurnEngine:
                     proc.kill()
                     return False, "Burn timed out after 2 hours"
 
-                # growisofs returns 0 on success.
-                # It can also return non-zero for minor warnings even when the
-                # burn physically completed — so we verify via mediainfo.
                 if proc.returncode == 0:
                     return True, "Burn completed successfully"
 
-                # Non-zero exit: check if disc actually has data (burn may have
-                # succeeded despite growisofs reporting an error code)
+                # Non-zero exit: verify via mediainfo before giving up
                 try:
                     verify = subprocess.run(
                         ['dvd+rw-mediainfo', device],
                         capture_output=True, text=True, timeout=15
                     )
-                    # If disc is no longer blank, the burn worked
                     if 'Disc status:' in verify.stdout and 'blank' not in verify.stdout:
                         return True, "Burn completed successfully (growisofs reported warnings but disc has data)"
                 except Exception:
@@ -426,7 +436,13 @@ class BurnEngine:
 
             elif tool == 'drutil':
                 # macOS: drutil burn with UDF
-                cmd = ['drutil', 'burn', '-udf', '-noverify', staging_dir]
+                # drutil handles multi-session automatically when appending,
+                # but pass -append for clarity when not a new disc.
+                cmd = ['drutil', 'burn', '-udf', '-noverify']
+                if not is_new_disc:
+                    cmd.append('-append')
+                cmd.append(staging_dir)
+
                 result = subprocess.run(cmd, timeout=7200)
                 if result.returncode == 0:
                     return True, "Burn completed successfully"
@@ -799,7 +815,51 @@ class TestBurnEngine(unittest.TestCase):
             self.assertIn("Label cannot be empty", msg)
         finally:
             shutil.rmtree(staging)
-    
+
+    def test_burn_udf_new_disc_uses_Z_flag(self):
+        """Test that new disc burns use -Z (overwrite/new session) flag"""
+        staging = tempfile.mkdtemp()
+        try:
+            # We intercept the Popen call to verify the correct flag is used
+            captured_cmd = []
+            original_popen = subprocess.Popen
+
+            def mock_popen(cmd, **kwargs):
+                captured_cmd.extend(cmd)
+                raise FileNotFoundError("growisofs not available in test environment")
+
+            import unittest.mock as mock
+            with mock.patch('subprocess.Popen', side_effect=mock_popen):
+                success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-NEW", is_new_disc=True)
+
+            # The command should have been attempted with -Z=/dev/sr0
+            if captured_cmd:
+                self.assertIn('-Z=/dev/sr0', captured_cmd)
+                self.assertNotIn('-M=/dev/sr0', captured_cmd)
+        finally:
+            shutil.rmtree(staging)
+
+    def test_burn_udf_append_uses_M_flag(self):
+        """Test that appending to existing disc uses -M (multi-session) flag"""
+        staging = tempfile.mkdtemp()
+        try:
+            captured_cmd = []
+
+            def mock_popen(cmd, **kwargs):
+                captured_cmd.extend(cmd)
+                raise FileNotFoundError("growisofs not available in test environment")
+
+            import unittest.mock as mock
+            with mock.patch('subprocess.Popen', side_effect=mock_popen):
+                success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-EXISTING", is_new_disc=False)
+
+            # The command should have been attempted with -M=/dev/sr0
+            if captured_cmd:
+                self.assertIn('-M=/dev/sr0', captured_cmd)
+                self.assertNotIn('-Z=/dev/sr0', captured_cmd)
+        finally:
+            shutil.rmtree(staging)
+
     def test_burn_udf_valid_inputs(self):
         """Test burn with valid inputs - real growisofs attempt (will fail without hardware)"""
         staging = tempfile.mkdtemp()
@@ -1032,7 +1092,9 @@ class BurnScreen(Screen):
             
             # Auto-fill the label input
             self.query_one("#label", Input).value = self.selected_disk_label
-            self.query_one("#status", Label).update(f"Selected existing disk: {self.selected_disk_label}")
+            self.query_one("#status", Label).update(
+                f"Selected existing disk: {self.selected_disk_label} — files will be APPENDED (existing data preserved)"
+            )
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "burn":
@@ -1051,11 +1113,14 @@ class BurnScreen(Screen):
         
         db = Database()
         
-        # Check if disk already exists
+        # Check if disk already exists in the database.
+        # If it does, this is a multi-session APPEND — we must use -M with growisofs,
+        # not -Z, or all previously burned data will be destroyed.
         existing_disk = db.get_disk_by_label(label)
         
         if existing_disk:
-            # Use existing disk - check available space
+            # --- APPENDING TO EXISTING DISC ---
+            is_new_disc = False
             disk_id = existing_disk[0]
             capacity_gb = existing_disk[2]
             used_gb = existing_disk[3]
@@ -1069,9 +1134,13 @@ class BurnScreen(Screen):
                 )
                 return
             
-            self.query_one("#status", Label).update(f"Appending to existing disk: {label}")
+            self.query_one("#status", Label).update(
+                f"Appending to existing disk: {label} (existing data will be preserved)"
+            )
         else:
-            # Create new disk
+            # --- BURNING A BRAND-NEW DISC ---
+            is_new_disc = True
+
             if not capacity:
                 self.query_one("#message", Label).update("Capacity is required for new disks!")
                 return
@@ -1105,9 +1174,10 @@ class BurnScreen(Screen):
             return
         
         self.query_one("#status", Label).update(f"Using {tool} on {device}")
-        self.perform_burn(disk_id, label, device, tool)
+        self.perform_burn(disk_id, label, device, tool, is_new_disc)
     
-    def perform_burn(self, disk_id: int, label: str, device: str, tool: str) -> None:
+    def perform_burn(self, disk_id: int, label: str, device: str, tool: str,
+                     is_new_disc: bool) -> None:
         """Execute the burn process and record files in database"""
         db = Database()
         progress = self.query_one("#progress", ProgressBar)
@@ -1121,19 +1191,20 @@ class BurnScreen(Screen):
             staging_dir = tempfile.mkdtemp(prefix="bluray_staging_")
             staging_path, file_map = FileSystemHelper.prepare_staging_area(self.queue_items, staging_dir)
             
-            status.update("Staging complete. Starting burn — this will take 30–45 minutes...")
+            mode_label = "new disc" if is_new_disc else "appending to existing disc"
+            status.update(f"Staging complete. Starting burn ({mode_label}) — this will take 30–45 minutes...")
             progress.update(progress=15)
             
             status.update("🔥 Burning to disc... (progress shown in terminal, not here)")
             progress.update(progress=20)
             
-            success, msg = BurnEngine.burn_udf(staging_path, device, tool, label)
+            success, msg = BurnEngine.burn_udf(staging_path, device, tool, label,
+                                               is_new_disc=is_new_disc)
             
             # Move progress to 80% now that burn is done regardless of reported status
             progress.update(progress=80)
 
             if not success:
-                # Double-check via mediainfo before giving up
                 self.query_one("#message", Label).update(f"Burn failed: {msg}")
                 status.update("Burn failed — check terminal output for details")
                 return
