@@ -8,12 +8,14 @@ Run tests: python bluray_backup.py --test
 Run app: python bluray_backup.py
 """
 
+import glob
 import sqlite3
 import os
 import subprocess
 import shutil
 import tempfile
 import unittest
+import unittest.mock
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -75,8 +77,10 @@ class Database:
         # Create indexes for better search performance
         c.execute('''CREATE INDEX IF NOT EXISTS idx_files_path 
                      ON files(file_path)''')
-        c.execute('''CREATE INDEX IF NOT EXISTS idx_files_disk 
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_files_disk_path 
                      ON files(disk_path)''')
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_files_disk_id
+                     ON files(disk_id)''')
         
         conn.commit()
         conn.close()
@@ -131,7 +135,7 @@ class Database:
         conn.close()
         return disk
     
-    def add_file(self, disk_id: int, file_path: str, disk_path: str, file_size_gb: float) -> Tuple[bool, str]:
+    def add_file(self, disk_id: int, file_path: str, disk_path: str, file_size_gb: float, checksum: Optional[str] = None) -> Tuple[bool, str]:
         """Add a file record to the database"""
         if not file_path or not file_path.strip():
             return False, "File path cannot be empty"
@@ -154,8 +158,8 @@ class Database:
         date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         try:
-            c.execute("INSERT INTO files (disk_id, file_path, disk_path, file_size_gb, backup_date) VALUES (?, ?, ?, ?, ?)",
-                     (disk_id, file_path.strip(), disk_path.strip(), file_size_gb, date))
+            c.execute("INSERT INTO files (disk_id, file_path, disk_path, file_size_gb, backup_date, checksum) VALUES (?, ?, ?, ?, ?, ?)",
+                     (disk_id, file_path.strip(), disk_path.strip(), file_size_gb, date, checksum))
             
             c.execute("UPDATE disks SET used_gb = used_gb + ? WHERE id = ?", (file_size_gb, disk_id))
             
@@ -279,7 +283,7 @@ class FileSystemHelper:
         
         file_map = {}  # Maps original path to staging path
         
-        for queue_id, filepath, size, _ in queue_items:
+        for _, filepath, _, _ in queue_items:
             source = Path(filepath)
             
             if not source.exists():
@@ -312,7 +316,7 @@ class BurnEngine:
     @staticmethod
     def detect_burner() -> Tuple[Optional[str], Optional[str]]:
         """Detect available burning tools and drives"""
-        system = os.uname().sysname if hasattr(os, 'uname') else 'Windows'
+        system = os.uname().sysname if hasattr(os, 'uname') else 'Unknown'
         
         if system == 'Linux':
             if shutil.which('growisofs'):
@@ -326,7 +330,6 @@ class BurnEngine:
     @staticmethod
     def find_linux_drive() -> str:
         """Find optical drive on Linux - prefer Blu-ray capable drives"""
-        import glob
         # Find all optical drives
         drives = sorted(glob.glob('/dev/sr*'))
         
@@ -356,8 +359,8 @@ class BurnEngine:
             lines = result.stdout.split('\n')
             for line in lines:
                 if 'Name:' in line:
-                    return line.split(':')[1].strip()
-        except:
+                    return line.split(':', 1)[1].strip()
+        except Exception:
             pass
         return 'disk1'
     
@@ -826,8 +829,7 @@ class TestBurnEngine(unittest.TestCase):
                 captured_cmd.extend(cmd)
                 raise FileNotFoundError("growisofs not available in test environment")
 
-            import unittest.mock as mock
-            with mock.patch('subprocess.Popen', side_effect=mock_popen):
+            with unittest.mock.patch('subprocess.Popen', side_effect=mock_popen):
                 success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-NEW", is_new_disc=True)
 
             if captured_cmd:
@@ -846,8 +848,7 @@ class TestBurnEngine(unittest.TestCase):
                 captured_cmd.extend(cmd)
                 raise FileNotFoundError("growisofs not available in test environment")
 
-            import unittest.mock as mock
-            with mock.patch('subprocess.Popen', side_effect=mock_popen):
+            with unittest.mock.patch('subprocess.Popen', side_effect=mock_popen):
                 success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-EXISTING", is_new_disc=False)
 
             if captured_cmd:
@@ -1023,7 +1024,6 @@ class BurnScreen(Screen):
     def __init__(self, queue_items: List[Tuple]):
         super().__init__()
         self.queue_items = queue_items
-        self.selected_disk_label = None
     
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1059,7 +1059,7 @@ class BurnScreen(Screen):
         
         if disks:
             for disk in disks:
-                disk_id, label, capacity, used, created, notes = disk
+                _, label, capacity, used, _, _ = disk
                 free = capacity - used
                 free_pct = round((free / capacity) * 100, 1) if capacity > 0 else 0
                 table.add_row(
@@ -1076,23 +1076,23 @@ class BurnScreen(Screen):
         if event.data_table.id == "disk_selector":
             table = self.query_one("#disk_selector", DataTable)
             row = table.get_row_at(event.cursor_row)
-            self.selected_disk_label = row[0]
+            selected_label = row[0]
             
             # Auto-fill the label input
-            self.query_one("#label", Input).value = self.selected_disk_label
+            self.query_one("#label", Input).value = selected_label
 
             # Look up used_gb to determine physical state
             db = Database()
-            disk = db.get_disk_by_label(self.selected_disk_label)
+            disk = db.get_disk_by_label(selected_label)
             used_gb = disk[3] if disk else 0
 
             if used_gb == 0:
                 self.query_one("#status", Label).update(
-                    f"Selected disk: {self.selected_disk_label} — registered but never burned, will use -Z (new disc)"
+                    f"Selected disk: {selected_label} — registered but never burned, will use -Z (new disc)"
                 )
             else:
                 self.query_one("#status", Label).update(
-                    f"Selected existing disk: {self.selected_disk_label} — files will be APPENDED (existing data preserved)"
+                    f"Selected existing disk: {selected_label} — files will be APPENDED (existing data preserved)"
                 )
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -1247,8 +1247,12 @@ class BurnScreen(Screen):
             self.query_one("#message", Label).update(f"Error: {str(e)}")
             status.update(f"Error occurred: {str(e)}")
         finally:
-            if staging_dir and Path(staging_dir).exists():
-                shutil.rmtree(staging_dir)
+            if staging_dir:
+                try:
+                    if Path(staging_dir).exists():
+                        shutil.rmtree(staging_dir)
+                except Exception:
+                    pass  # Cleanup failure should not mask the original error
 
 
 class AddDiskScreen(Screen):
@@ -1370,9 +1374,49 @@ class QueueScreen(Screen):
                 if success:
                     self.refresh_queue()
                     self.notify(msg, severity="information")
+                else:
+                    self.notify(msg, severity="error")
     
     def on_screen_resume(self) -> None:
         self.refresh_queue()
+
+
+class DiskFilesScreen(Screen):
+    """Screen for viewing all files stored on a specific disk"""
+
+    BINDINGS = [("escape", "app.pop_screen", "Back")]
+
+    def __init__(self, disk_id: int, disk_label: str):
+        super().__init__()
+        self.disk_id = disk_id
+        self.disk_label = disk_label
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Container(
+            Label(f"Files on Disk: {self.disk_label}", id="title"),
+            DataTable(id="files_table"),
+            Button("Back", variant="default", id="back"),
+            id="queue_container"
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#files_table", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("Original Path", "Path on Disc", "Size (GB)", "Backup Date")
+
+        db = Database()
+        files = db.get_files_for_disk(self.disk_id)
+        for _, file_path, disk_path, size, date in files:
+            table.add_row(file_path, disk_path, f"{size:.4f}", date)
+
+        if not files:
+            self.notify("No files recorded for this disk yet.", severity="information")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "back":
+            self.app.pop_screen()
 
 
 class BlurayBackupApp(App):
@@ -1483,6 +1527,7 @@ class BlurayBackupApp(App):
         Binding("a", "add_disk", "Add Disk"),
         Binding("s", "search", "Search"),
         Binding("b", "show_queue", "Burn Queue"),
+        Binding("v", "view_files", "View Files"),
     ]
     
     def __init__(self):
@@ -1501,6 +1546,7 @@ class BlurayBackupApp(App):
                 Button("Add Disk (a)", variant="primary", id="add_disk"),
                 Button("Burn Queue (b)", variant="success", id="queue"),
                 Button("Search (s)", variant="default", id="search"),
+                Button("View Files (v)", variant="default", id="view_files"),
                 Button("Refresh", variant="default", id="refresh"),
             ),
             id="controls"
@@ -1540,6 +1586,8 @@ class BlurayBackupApp(App):
             self.action_show_queue()
         elif event.button.id == "search":
             self.action_search()
+        elif event.button.id == "view_files":
+            self.action_view_files()
         elif event.button.id == "refresh":
             self.refresh_table()
     
@@ -1563,6 +1611,13 @@ class BlurayBackupApp(App):
     
     def action_search(self) -> None:
         self.push_screen(SearchScreen())
+
+    def action_view_files(self) -> None:
+        if self.selected_disk is None:
+            self.notify("Select a disk row first.", severity="warning")
+            return
+        disk_id, disk_label = self.selected_disk
+        self.push_screen(DiskFilesScreen(disk_id, disk_label))
     
     def on_screen_resume(self) -> None:
         self.refresh_table()
