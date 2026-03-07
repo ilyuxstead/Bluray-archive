@@ -820,9 +820,7 @@ class TestBurnEngine(unittest.TestCase):
         """Test that new disc burns use -Z (overwrite/new session) flag"""
         staging = tempfile.mkdtemp()
         try:
-            # We intercept the Popen call to verify the correct flag is used
             captured_cmd = []
-            original_popen = subprocess.Popen
 
             def mock_popen(cmd, **kwargs):
                 captured_cmd.extend(cmd)
@@ -832,7 +830,6 @@ class TestBurnEngine(unittest.TestCase):
             with mock.patch('subprocess.Popen', side_effect=mock_popen):
                 success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-NEW", is_new_disc=True)
 
-            # The command should have been attempted with -Z=/dev/sr0
             if captured_cmd:
                 self.assertIn('-Z=/dev/sr0', captured_cmd)
                 self.assertNotIn('-M=/dev/sr0', captured_cmd)
@@ -853,7 +850,6 @@ class TestBurnEngine(unittest.TestCase):
             with mock.patch('subprocess.Popen', side_effect=mock_popen):
                 success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-EXISTING", is_new_disc=False)
 
-            # The command should have been attempted with -M=/dev/sr0
             if captured_cmd:
                 self.assertIn('-M=/dev/sr0', captured_cmd)
                 self.assertNotIn('-Z=/dev/sr0', captured_cmd)
@@ -865,8 +861,6 @@ class TestBurnEngine(unittest.TestCase):
         staging = tempfile.mkdtemp()
         try:
             success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-001")
-            # Without real hardware growisofs will fail or not be found - both are valid.
-            # We just verify the method returns a proper (bool, str) tuple.
             self.assertIsInstance(success, bool)
             self.assertIsInstance(msg, str)
             self.assertGreater(len(msg), 0)
@@ -923,7 +917,6 @@ class SearchScreen(Screen):
         if results:
             for filepath, disk_path, size, date, disk_label in results:
                 table.add_row(filepath, disk_path, f"{size:.2f}", date, disk_label)
-            # Force refresh to ensure table is rendered
             self.refresh()
             self.notify(f"Found {len(results)} file(s)", severity="information")
         else:
@@ -965,16 +958,13 @@ class AddToQueueScreen(Screen):
             return
 
         try:
-            # Expand ~ to the real home directory
             filepath = str(Path(filepath).expanduser())
 
-            # Check if the input contains a wildcard
             if '*' in filepath or '?' in filepath:
                 parent = Path(filepath).parent
                 pattern = Path(filepath).name
 
                 if not parent.exists():
-                    # Give a helpful hint about case sensitivity
                     self.query_one("#message", Label).update(
                         f"Directory not found: {parent}\n"
                         f"Note: Linux paths are case-sensitive (use /home not /Home)"
@@ -988,7 +978,6 @@ class AddToQueueScreen(Screen):
                     )
                     return
 
-                # Add each matched file to the queue individually
                 db = Database()
                 added = 0
                 for match in matched_files:
@@ -1004,7 +993,6 @@ class AddToQueueScreen(Screen):
                 else:
                     self.query_one("#message", Label).update("No files could be added to the queue")
             else:
-                # Single file or directory path
                 path = Path(filepath).resolve()
                 if not path.exists():
                     self.query_one("#message", Label).update(
@@ -1092,9 +1080,20 @@ class BurnScreen(Screen):
             
             # Auto-fill the label input
             self.query_one("#label", Input).value = self.selected_disk_label
-            self.query_one("#status", Label).update(
-                f"Selected existing disk: {self.selected_disk_label} — files will be APPENDED (existing data preserved)"
-            )
+
+            # Look up used_gb to determine physical state
+            db = Database()
+            disk = db.get_disk_by_label(self.selected_disk_label)
+            used_gb = disk[3] if disk else 0
+
+            if used_gb == 0:
+                self.query_one("#status", Label).update(
+                    f"Selected disk: {self.selected_disk_label} — registered but never burned, will use -Z (new disc)"
+                )
+            else:
+                self.query_one("#status", Label).update(
+                    f"Selected existing disk: {self.selected_disk_label} — files will be APPENDED (existing data preserved)"
+                )
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "burn":
@@ -1113,18 +1112,23 @@ class BurnScreen(Screen):
         
         db = Database()
         
-        # Check if disk already exists in the database.
-        # If it does, this is a multi-session APPEND — we must use -M with growisofs,
-        # not -Z, or all previously burned data will be destroyed.
+        # Determine physical disc state based on used_gb, not mere DB presence.
+        #
+        # A disk can be pre-registered in the DB (used_gb == 0) but still be
+        # a blank, unwritten disc.  We must use -Z for physically blank media
+        # and -M only when data has already been burned.
+        # • Using -M on a blank disc  → growisofs error / burn fails
+        # • Using -Z on a written disc → silently destroys all existing data
         existing_disk = db.get_disk_by_label(label)
         
         if existing_disk:
-            # --- APPENDING TO EXISTING DISC ---
-            is_new_disc = False
             disk_id = existing_disk[0]
             capacity_gb = existing_disk[2]
             used_gb = existing_disk[3]
-            
+
+            # is_new_disc == True means "physically blank" — nothing burned yet
+            is_new_disc = (used_gb == 0)
+
             total_size = sum(item[2] for item in self.queue_items)
             available_space = capacity_gb - used_gb
             
@@ -1134,11 +1138,16 @@ class BurnScreen(Screen):
                 )
                 return
             
-            self.query_one("#status", Label).update(
-                f"Appending to existing disk: {label} (existing data will be preserved)"
-            )
+            if is_new_disc:
+                self.query_one("#status", Label).update(
+                    f"Disk '{label}' is registered but blank — burning as new disc (-Z)"
+                )
+            else:
+                self.query_one("#status", Label).update(
+                    f"Appending to existing disk: {label} (existing data will be preserved)"
+                )
         else:
-            # --- BURNING A BRAND-NEW DISC ---
+            # Brand-new label — not in DB at all, definitely a blank disc
             is_new_disc = True
 
             if not capacity:
@@ -1201,7 +1210,6 @@ class BurnScreen(Screen):
             success, msg = BurnEngine.burn_udf(staging_path, device, tool, label,
                                                is_new_disc=is_new_disc)
             
-            # Move progress to 80% now that burn is done regardless of reported status
             progress.update(progress=80)
 
             if not success:
@@ -1211,17 +1219,14 @@ class BurnScreen(Screen):
             
             status.update("Recording files in database...")
             
-            # Record all files individually in database
             for item in self.queue_items:
                 queue_id, filepath, size, _ = item
                 source_path = Path(filepath)
                 
                 if source_path.is_file():
-                    # Single file - add it directly
                     disk_path = file_map.get(filepath, source_path.name)
                     db.add_file(disk_id, filepath, disk_path, size)
                 else:
-                    # Directory - add each file individually for searchability
                     base_disk_path = file_map.get(filepath, source_path.name)
                     for file in source_path.rglob('*'):
                         if file.is_file():
@@ -1242,7 +1247,6 @@ class BurnScreen(Screen):
             self.query_one("#message", Label).update(f"Error: {str(e)}")
             status.update(f"Error occurred: {str(e)}")
         finally:
-            # Always clean up staging directory, whether burn succeeded or failed
             if staging_dir and Path(staging_dir).exists():
                 shutil.rmtree(staging_dir)
 
@@ -1575,20 +1579,16 @@ def run_tests():
     print("=" * 70)
     print()
     
-    # Create test suite
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     
-    # Add all test classes
     suite.addTests(loader.loadTestsFromTestCase(TestDatabase))
     suite.addTests(loader.loadTestsFromTestCase(TestFileSystemHelper))
     suite.addTests(loader.loadTestsFromTestCase(TestBurnEngine))
     
-    # Run tests with verbose output
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     
-    # Print summary
     print()
     print("=" * 70)
     print(f"Tests run: {result.testsRun}")
@@ -1602,10 +1602,8 @@ def run_tests():
 
 if __name__ == "__main__":
     if "--test" in sys.argv:
-        # Run unit tests
         success = run_tests()
         sys.exit(0 if success else 1)
     else:
-        # Run the TUI application
         app = BlurayBackupApp()
         app.run()
