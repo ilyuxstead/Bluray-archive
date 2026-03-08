@@ -135,8 +135,26 @@ class Database:
         conn.close()
         return disk
     
-    def add_file(self, disk_id: int, file_path: str, disk_path: str, file_size_gb: float, checksum: Optional[str] = None) -> Tuple[bool, str]:
-        """Add a file record to the database"""
+    def delete_disk(self, disk_id: int) -> None:
+        """Delete a disk record (used to roll back a pre-burn disk creation on failure)"""
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("DELETE FROM disks WHERE id = ?", (disk_id,))
+        conn.commit()
+        conn.close()
+
+    def add_file(self, disk_id: int, file_path: str, disk_path: str, file_size_gb: float,
+                 checksum: Optional[str] = None) -> Tuple[bool, str]:
+        """Add a file record to the database.
+
+        Guards:
+        - Rejects duplicate (disk_id, file_path, disk_path) triples to prevent
+          double-counting used_gb if perform_burn is somehow called twice.
+          (Bug 3 fix — double-write guard)
+        - Caps used_gb at capacity_gb so the displayed free space never goes
+          negative due to rounding or edge-case re-runs.
+          (Bug 3 fix — cap guard)
+        """
         if not file_path or not file_path.strip():
             return False, "File path cannot be empty"
         
@@ -149,19 +167,39 @@ class Database:
         conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
         
-        # Verify disk exists
-        c.execute("SELECT id FROM disks WHERE id = ?", (disk_id,))
-        if not c.fetchone():
+        # Verify disk exists and fetch capacity for the cap guard
+        c.execute("SELECT id, capacity_gb FROM disks WHERE id = ?", (disk_id,))
+        disk_row = c.fetchone()
+        if not disk_row:
             conn.close()
             return False, "Disk not found"
-        
+        capacity_gb = disk_row[1]
+
+        # Double-write guard: skip if this exact file record already exists
+        c.execute(
+            "SELECT id FROM files WHERE disk_id = ? AND file_path = ? AND disk_path = ?",
+            (disk_id, file_path.strip(), disk_path.strip())
+        )
+        if c.fetchone():
+            conn.close()
+            return False, "File record already exists (skipped to prevent double-count)"
+
         date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         try:
-            c.execute("INSERT INTO files (disk_id, file_path, disk_path, file_size_gb, backup_date, checksum) VALUES (?, ?, ?, ?, ?, ?)",
-                     (disk_id, file_path.strip(), disk_path.strip(), file_size_gb, date, checksum))
+            c.execute(
+                "INSERT INTO files (disk_id, file_path, disk_path, file_size_gb, backup_date, checksum) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (disk_id, file_path.strip(), disk_path.strip(), file_size_gb, date, checksum)
+            )
             
-            c.execute("UPDATE disks SET used_gb = used_gb + ? WHERE id = ?", (file_size_gb, disk_id))
+            # Cap used_gb at capacity_gb to prevent overflow from rounding or re-runs
+            c.execute(
+                """UPDATE disks
+                      SET used_gb = MIN(capacity_gb, used_gb + ?)
+                    WHERE id = ?""",
+                (file_size_gb, disk_id)
+            )
             
             conn.commit()
             return True, "File added successfully"
@@ -236,7 +274,26 @@ class Database:
         c.execute("DELETE FROM burn_queue")
         conn.commit()
         conn.close()
-    
+
+    def remove_queue_items(self, queue_ids: List[int]) -> int:
+        """Remove specific items from the burn queue by ID.
+
+        Returns the number of rows deleted.
+        Only items that were actually staged and burned should be removed;
+        silently-skipped items are left in the queue so the user can retry.
+        (Bug 2 fix)
+        """
+        if not queue_ids:
+            return 0
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        placeholders = ",".join("?" * len(queue_ids))
+        c.execute(f"DELETE FROM burn_queue WHERE id IN ({placeholders})", queue_ids)
+        deleted = c.rowcount
+        conn.commit()
+        conn.close()
+        return deleted
+
     def remove_from_queue(self, queue_id: int) -> Tuple[bool, str]:
         """Remove a specific item from the burn queue"""
         if queue_id <= 0:
@@ -273,7 +330,12 @@ class FileSystemHelper:
     
     @staticmethod
     def prepare_staging_area(queue_items: List[Tuple], staging_dir: str) -> Tuple[str, Dict[str, str]]:
-        """Prepare a staging directory with all files to burn"""
+        """Prepare a staging directory with all files to burn.
+
+        Returns (staging_path, file_map) where file_map only contains entries
+        for source paths that actually existed and were successfully copied.
+        Callers must NOT assume every queue item appears in file_map.
+        """
         staging_path = Path(staging_dir)
         
         # Clean and create staging directory
@@ -281,19 +343,19 @@ class FileSystemHelper:
             shutil.rmtree(staging_path)
         staging_path.mkdir(parents=True)
         
-        file_map = {}  # Maps original path to staging path
+        file_map = {}  # Maps original path -> relative path inside staging dir
         
         for _, filepath, _, _ in queue_items:
             source = Path(filepath)
             
             if not source.exists():
+                # Source is missing — intentionally excluded from file_map so
+                # the caller knows this item was skipped (Bug 2 fix).
                 continue
             
             # Create relative path structure
             if source.is_file():
-                # Use just the filename for files
                 dest = staging_path / source.name
-                # Handle duplicates
                 counter = 1
                 while dest.exists():
                     dest = staging_path / f"{source.stem}_{counter}{source.suffix}"
@@ -302,7 +364,6 @@ class FileSystemHelper:
                 shutil.copy2(source, dest)
                 file_map[str(source)] = str(dest.relative_to(staging_path))
             else:
-                # For directories, preserve structure
                 dest_dir = staging_path / source.name
                 shutil.copytree(source, dest_dir)
                 file_map[str(source)] = str(dest_dir.relative_to(staging_path))
@@ -330,26 +391,22 @@ class BurnEngine:
     @staticmethod
     def find_linux_drive() -> str:
         """Find optical drive on Linux - prefer Blu-ray capable drives"""
-        # Find all optical drives
         drives = sorted(glob.glob('/dev/sr*'))
         
-        # Try to identify the Blu-ray drive by checking media info
         for drive in drives:
             try:
                 result = subprocess.run(
                     ['dvd+rw-mediainfo', drive],
                     capture_output=True, text=True, timeout=5
                 )
-                # Prefer drives that mention BD (Blu-ray)
                 if 'BD' in result.stdout or 'blu' in result.stdout.lower():
                     return drive
             except Exception:
                 pass
         
-        # Fall back to last drive (sr1 if two drives present, sr0 if only one)
         if drives:
             return drives[-1]
-        return '/dev/sr0'  # Absolute default
+        return '/dev/sr0'
     
     @staticmethod
     def find_macos_drive() -> str:
@@ -367,11 +424,7 @@ class BurnEngine:
     @staticmethod
     def build_command(staging_dir: str, device: str, tool: str, label: str,
                       is_new_disc: bool = True) -> List[str]:
-        """Build the burn command without executing it.
-        
-        Returns the exact command list that burn_udf would run, allowing
-        it to be displayed to the user before execution.
-        """
+        """Build the burn command without executing it."""
         if tool == 'growisofs':
             session_flag = '-Z' if is_new_disc else '-M'
             return [
@@ -474,28 +527,22 @@ class TestDatabase(unittest.TestCase):
     """Test database operations"""
     
     def setUp(self):
-        """Create a temporary database for testing"""
         self.test_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
         self.test_db.close()
         self.db = Database(self.test_db.name)
     
     def tearDown(self):
-        """Clean up temporary database"""
         if os.path.exists(self.test_db.name):
             os.unlink(self.test_db.name)
     
     def test_init_db(self):
-        """Test database initialization"""
         conn = sqlite3.connect(self.test_db.name)
         c = conn.cursor()
-        
         c.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = [row[0] for row in c.fetchall()]
-        
         self.assertIn('disks', tables)
         self.assertIn('files', tables)
         self.assertIn('burn_queue', tables)
-        
         conn.close()
     
     def test_add_disk_success(self):
@@ -571,7 +618,25 @@ class TestDatabase(unittest.TestCase):
         success, msg = self.db.add_file(disk_id, "/path/to/file.txt", "file.txt", -1.5)
         self.assertFalse(success)
         self.assertEqual(msg, "File size cannot be negative")
-    
+
+    def test_add_file_double_write_guard(self):
+        """Bug 3 fix: adding the same file record twice must not double-count used_gb"""
+        _, _, disk_id = self.db.add_disk("TEST-001", 25)
+        self.db.add_file(disk_id, "/path/to/file.txt", "file.txt", 2.0)
+        success, msg = self.db.add_file(disk_id, "/path/to/file.txt", "file.txt", 2.0)
+        self.assertFalse(success)  # Second insert should be rejected
+        disk = self.db.get_disk_by_id(disk_id)
+        self.assertAlmostEqual(disk[3], 2.0)  # used_gb must still be 2.0, not 4.0
+
+    def test_add_file_used_gb_capped_at_capacity(self):
+        """Bug 3 fix: used_gb must never exceed capacity_gb"""
+        _, _, disk_id = self.db.add_disk("TEST-CAP", 1)  # 1 GB capacity
+        # Add two files that together exceed capacity (edge-case rounding scenario)
+        self.db.add_file(disk_id, "/path/a.bin", "a.bin", 0.7)
+        self.db.add_file(disk_id, "/path/b.bin", "b.bin", 0.7)
+        disk = self.db.get_disk_by_id(disk_id)
+        self.assertLessEqual(disk[3], disk[2])  # used_gb <= capacity_gb
+
     def test_get_files_for_disk(self):
         _, _, disk_id = self.db.add_disk("TEST-001", 25)
         self.db.add_file(disk_id, "/path/to/file1.txt", "file1.txt", 1.0)
@@ -640,6 +705,20 @@ class TestDatabase(unittest.TestCase):
         queue = self.db.get_queue()
         self.assertEqual(len(queue), 0)
 
+    def test_remove_queue_items_selective(self):
+        """Bug 2 fix: remove_queue_items only removes specified IDs, leaving others intact"""
+        self.db.add_to_queue("/path/to/file1.txt", 1.0)
+        self.db.add_to_queue("/path/to/file2.txt", 2.0)
+        queue = self.db.get_queue()
+        id1 = queue[0][0]
+        id2 = queue[1][0]
+        # Only remove the first item
+        deleted = self.db.remove_queue_items([id1])
+        self.assertEqual(deleted, 1)
+        remaining = self.db.get_queue()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0][0], id2)
+
 
 class TestFileSystemHelper(unittest.TestCase):
     
@@ -676,6 +755,23 @@ class TestFileSystemHelper(unittest.TestCase):
             self.assertIn(str(self.test_file), file_map)
             staged_file = Path(staging_path) / "test.txt"
             self.assertTrue(staged_file.exists())
+        finally:
+            if os.path.exists(staging_dir):
+                shutil.rmtree(staging_dir)
+
+    def test_prepare_staging_area_skips_missing(self):
+        """Bug 2 fix: missing source files must be absent from file_map, not raise"""
+        queue_items = [
+            (1, str(self.test_file), 0.001, "2024-01-01"),
+            (2, "/nonexistent/ghost_file.txt", 0.5, "2024-01-01"),
+        ]
+        staging_dir = tempfile.mkdtemp()
+        try:
+            staging_path, file_map = FileSystemHelper.prepare_staging_area(queue_items, staging_dir)
+            # Only the real file should be in the map
+            self.assertIn(str(self.test_file), file_map)
+            self.assertNotIn("/nonexistent/ghost_file.txt", file_map)
+            self.assertEqual(len(file_map), 1)
         finally:
             if os.path.exists(staging_dir):
                 shutil.rmtree(staging_dir)
@@ -771,13 +867,11 @@ class TestBurnEngine(unittest.TestCase):
             shutil.rmtree(staging)
 
     def test_build_command_new_disc(self):
-        """Test that build_command returns -Z flag for new discs"""
         cmd = BurnEngine.build_command("/tmp/staging", "/dev/sr0", "growisofs", "TEST", is_new_disc=True)
         self.assertIn('-Z=/dev/sr0', cmd)
         self.assertNotIn('-M=/dev/sr0', cmd)
 
     def test_build_command_append(self):
-        """Test that build_command returns -M flag for appending"""
         cmd = BurnEngine.build_command("/tmp/staging", "/dev/sr0", "growisofs", "TEST", is_new_disc=False)
         self.assertIn('-M=/dev/sr0', cmd)
         self.assertNotIn('-Z=/dev/sr0', cmd)
@@ -914,12 +1008,7 @@ class AddToQueueScreen(Screen):
 
 
 class BurnConfirmModal(ModalScreen):
-    """Modal confirmation dialog shown before any burn operation.
-    
-    Displays the exact command, device, tool, session mode, and queue
-    summary so the user can verify everything looks correct before
-    committing to a potentially long, irreversible burn.
-    """
+    """Modal confirmation dialog shown before any burn operation."""
 
     def __init__(self,
                  tool: str,
@@ -1051,9 +1140,15 @@ class BurnScreen(Screen):
             self.app.pop_screen()
     
     def start_burn(self) -> None:
-        """Validate inputs, then show confirmation modal before burning."""
+        """Validate inputs and show confirmation modal.
+
+        Bug 1 fix: db.add_disk() for brand-new labels is now deferred until
+        AFTER the user confirms in the modal and AFTER the burn succeeds.
+        start_burn() only validates and collects parameters; perform_burn()
+        creates the disk record at the last responsible moment.
+        """
         label = self.query_one("#label", Input).value.strip()
-        capacity = self.query_one("#capacity", Input).value.strip()
+        capacity_input = self.query_one("#capacity", Input).value.strip()
 
         if not label:
             self.query_one("#message", Label).update("Label is required!")
@@ -1063,7 +1158,7 @@ class BurnScreen(Screen):
         existing_disk = db.get_disk_by_label(label)
 
         if existing_disk:
-            disk_id = existing_disk[0]
+            # Existing disk — resolve everything now, no DB write needed here
             capacity_gb = existing_disk[2]
             used_gb = existing_disk[3]
             is_new_disc = (used_gb == 0)
@@ -1075,26 +1170,35 @@ class BurnScreen(Screen):
                     f"Not enough space! Need {total_size:.2f} GB, only {available_space:.2f} GB available"
                 )
                 return
+
+            # Pass None for capacity_gb_new — disk already exists
+            self._show_confirm_modal(label, is_new_disc, capacity_gb_new=None)
+
         else:
+            # Brand-new label — validate capacity but do NOT create the DB record yet
+            # (Bug 1 fix: disk record created only after confirmed burn succeeds)
             is_new_disc = True
-            if not capacity:
+            if not capacity_input:
                 self.query_one("#message", Label).update("Capacity is required for new disks!")
                 return
             try:
-                capacity_gb = int(capacity)
+                capacity_gb_new = int(capacity_input)
             except ValueError:
                 self.query_one("#message", Label).update("Capacity must be a number!")
                 return
+
             total_size = sum(item[2] for item in self.queue_items)
-            if total_size > capacity_gb:
-                self.query_one("#message", Label).update(f"Queue too large! {total_size:.2f} GB > {capacity_gb} GB")
-                return
-            success, msg, disk_id = db.add_disk(label, capacity_gb, "Burned with UDF filesystem")
-            if not success:
-                self.query_one("#message", Label).update(msg)
+            if total_size > capacity_gb_new:
+                self.query_one("#message", Label).update(
+                    f"Queue too large! {total_size:.2f} GB > {capacity_gb_new} GB"
+                )
                 return
 
-        # Detect burning hardware
+            self._show_confirm_modal(label, is_new_disc, capacity_gb_new=capacity_gb_new)
+
+    def _show_confirm_modal(self, label: str, is_new_disc: bool,
+                             capacity_gb_new: Optional[int]) -> None:
+        """Build the preview command and push the confirmation modal."""
         tool, device = BurnEngine.detect_burner()
         if not tool:
             self.query_one("#message", Label).update(
@@ -1102,9 +1206,6 @@ class BurnScreen(Screen):
             )
             return
 
-        # Build the exact command that will be run — using a placeholder staging
-        # path since the real staging dir hasn't been created yet. The placeholder
-        # makes the intent clear without exposing a temp path that doesn't exist yet.
         preview_cmd = BurnEngine.build_command(
             "<staging-dir>", device, tool, label, is_new_disc
         )
@@ -1114,7 +1215,7 @@ class BurnScreen(Screen):
 
         def on_confirm(confirmed: bool) -> None:
             if confirmed:
-                self.perform_burn(disk_id, label, device, tool, is_new_disc)
+                self.perform_burn(label, device, tool, is_new_disc, capacity_gb_new)
 
         self.app.push_screen(
             BurnConfirmModal(
@@ -1129,44 +1230,100 @@ class BurnScreen(Screen):
             on_confirm
         )
 
-    def perform_burn(self, disk_id: int, label: str, device: str, tool: str,
-                     is_new_disc: bool) -> None:
-        """Execute the burn process and record files in database"""
+    def perform_burn(self, label: str, device: str, tool: str,
+                     is_new_disc: bool, capacity_gb_new: Optional[int]) -> None:
+        """Execute the burn process and record files in database.
+
+        Bug 1 fix: db.add_disk() for brand-new disks is called HERE, after the
+        user has confirmed and only proceeds if the burn itself succeeds.
+
+        Bug 2 fix: only queue items whose source path was actually staged
+        (present in file_map) are removed from the queue. Items skipped because
+        their source was missing remain in the queue so the user can retry.
+
+        Bug 3 fix: add_file() now uses MIN(capacity_gb, used_gb + ?) and a
+        duplicate-record guard (see Database.add_file).
+        """
         db = Database()
         progress = self.query_one("#progress", ProgressBar)
         status = self.query_one("#status", Label)
         staging_dir = None
+        # Track whether we created a new disk record so we can roll it back on failure
+        created_disk_id: Optional[int] = None
 
         try:
             status.update("Preparing files for burning...")
             progress.update(progress=5)
-            
+
             staging_dir = tempfile.mkdtemp(prefix="bluray_staging_")
-            staging_path, file_map = FileSystemHelper.prepare_staging_area(self.queue_items, staging_dir)
-            
-            mode_label = "new disc" if is_new_disc else "appending to existing disc"
-            status.update(f"Staging complete. Starting burn ({mode_label}) — this will take 30–45 minutes...")
+            staging_path, file_map = FileSystemHelper.prepare_staging_area(
+                self.queue_items, staging_dir
+            )
+
+            # Warn if some items were silently skipped during staging (Bug 2 awareness)
+            staged_count = len(file_map)
+            total_count = len(self.queue_items)
+            if staged_count < total_count:
+                skipped = total_count - staged_count
+                status.update(
+                    f"Warning: {skipped} item(s) skipped (source path not found). "
+                    f"Burning {staged_count}/{total_count} item(s)..."
+                )
+            else:
+                mode_label = "new disc" if is_new_disc else "appending to existing disc"
+                status.update(
+                    f"Staging complete. Starting burn ({mode_label}) — "
+                    f"this will take 30–45 minutes..."
+                )
+
             progress.update(progress=15)
-            
             status.update("🔥 Burning to disc... (progress shown in terminal, not here)")
             progress.update(progress=20)
-            
-            success, msg = BurnEngine.burn_udf(staging_path, device, tool, label,
-                                               is_new_disc=is_new_disc)
-            
+
+            success, msg = BurnEngine.burn_udf(
+                staging_path, device, tool, label, is_new_disc=is_new_disc
+            )
+
             progress.update(progress=80)
 
             if not success:
                 self.query_one("#message", Label).update(f"Burn failed: {msg}")
                 status.update("Burn failed — check terminal output for details")
+                # Do NOT create any disk record or touch the queue on failure
                 return
-            
+
+            # ----------------------------------------------------------------
+            # Burn succeeded — now create the disk record if this is a new disk
+            # (Bug 1 fix: disk record only written after confirmed success)
+            # ----------------------------------------------------------------
+            if capacity_gb_new is not None:
+                # Brand-new disk
+                ok, db_msg, new_id = db.add_disk(label, capacity_gb_new, "Burned with UDF filesystem")
+                if not ok:
+                    self.query_one("#message", Label).update(
+                        f"Burn succeeded but could not register disk: {db_msg}"
+                    )
+                    status.update("Burn OK — disk registration failed (manual recovery needed)")
+                    return
+                disk_id = new_id
+                created_disk_id = new_id
+            else:
+                existing = db.get_disk_by_label(label)
+                disk_id = existing[0]
+
             status.update("Recording files in database...")
-            
+
+            # Build set of staged source paths for selective queue removal (Bug 2 fix)
+            staged_source_paths = set(file_map.keys())
+
             for item in self.queue_items:
                 queue_id, filepath, size, _ = item
+
+                # Only record files that were actually staged
+                if filepath not in staged_source_paths:
+                    continue
+
                 source_path = Path(filepath)
-                
                 if source_path.is_file():
                     disk_path = file_map.get(filepath, source_path.name)
                     db.add_file(disk_id, filepath, disk_path, size)
@@ -1174,22 +1331,44 @@ class BurnScreen(Screen):
                     base_disk_path = file_map.get(filepath, source_path.name)
                     for file in source_path.rglob('*'):
                         if file.is_file():
-                            file_size_gb = file.stat().st_size / (1024**3)
+                            file_size_gb = file.stat().st_size / (1024 ** 3)
                             rel_path = file.relative_to(source_path)
                             file_disk_path = str(Path(base_disk_path) / rel_path)
                             db.add_file(disk_id, str(file), file_disk_path, file_size_gb)
-            
-            db.clear_queue()
-            
+
+            # Remove only the queue items that were actually staged (Bug 2 fix)
+            burned_queue_ids = [
+                item[0] for item in self.queue_items
+                if item[1] in staged_source_paths
+            ]
+            db.remove_queue_items(burned_queue_ids)
+
             progress.update(progress=100)
-            status.update("✅ Burn completed successfully! Files are now searchable and restorable.")
-            
-            self.notify("Burn completed! Files added to database.", severity="information")
+
+            if staged_count < total_count:
+                skipped = total_count - staged_count
+                status.update(
+                    f"✅ Burn complete! {skipped} item(s) with missing sources remain in queue."
+                )
+                self.notify(
+                    f"Burn done — {skipped} item(s) skipped (source missing) left in queue.",
+                    severity="warning"
+                )
+            else:
+                status.update("✅ Burn completed successfully! Files are now searchable and restorable.")
+                self.notify("Burn completed! Files added to database.", severity="information")
+
             self.query_one("#burn", Button).disabled = True
-            
+
         except Exception as e:
             self.query_one("#message", Label).update(f"Error: {str(e)}")
             status.update(f"Error occurred: {str(e)}")
+            # Roll back any disk record we created in this run so we don't leave ghosts
+            if created_disk_id is not None:
+                try:
+                    db.delete_disk(created_disk_id)
+                except Exception:
+                    pass
         finally:
             if staging_dir:
                 try:
