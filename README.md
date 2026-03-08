@@ -4,7 +4,8 @@ A Terminal User Interface (TUI) application for managing and cataloging file bac
 
 ![Python Version](https://img.shields.io/badge/python-3.7+-blue.svg)
 ![License](https://img.shields.io/badge/license-MPL_2.0-green.svg)
-![Tests](https://img.shields.io/badge/tests-34%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-55%20passing-brightgreen.svg)
+![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)
 
 ## Features
 
@@ -32,7 +33,7 @@ A Terminal User Interface (TUI) application for managing and cataloging file bac
 ### 🎯 Clean Architecture
 
 - Separation of business logic and UI
-- Comprehensive unit tests (34 tests)
+- Comprehensive unit tests (55 tests)
 - Type hints throughout
 - Well-documented code
 
@@ -111,7 +112,7 @@ chmod +x bluray_backup.py
 #### 1. Add Files to Queue
 
 1. Press `b` to open Burn Queue
-1. Click “Add Files”
+1. Click "Add Files"
 1. Enter file or directory path
 1. Files are added with automatic size calculation
 
@@ -119,12 +120,15 @@ chmod +x bluray_backup.py
 
 #### 2. Burn to Disc
 
-1. In Burn Queue, click “Burn to Disc”
+1. In Burn Queue, click "Burn to Disc"
 1. **Select existing disk** from the table (for multi-session)
 - Or enter new disk label to create new disc
 1. Set capacity (25, 50, or 100 GB for new discs)
-1. Click “Start Burn”
+1. Click "Start Burn"
+1. A confirmation dialog shows the exact command that will be run before anything touches the disc
 1. Files are burned and automatically cataloged
+
+> **Progress bar note:** The bar pauses at 20% during the actual burn — this is expected. Live `growisofs` output (including real progress) appears directly in your terminal window behind the TUI.
 
 #### 3. Search for Files
 
@@ -153,12 +157,12 @@ bluray_backup.py
 │   ├── Database (SQLite operations)
 │   ├── FileSystemHelper (File operations)
 │   └── BurnEngine (Burning operations)
-├── Unit Tests (34 comprehensive tests)
+├── Unit Tests (55 comprehensive tests)
 └── TUI Layer
     ├── Main Application
     ├── Search Screen
     ├── Queue Screen
-    ├── Burn Screen
+    ├── Burn Screen + Confirmation Modal
     └── Add Disk Screen
 ```
 
@@ -190,7 +194,7 @@ python3 bluray_backup.py
 Press 'b' → Add Files → /home/user/photos
 
 # Burn to new disc
-Burn to Disc → Enter "BACKUP-2024-001" → Capacity: 25 → Start Burn
+Burn to Disc → Enter "BACKUP-2024-001" → Capacity: 25 → Start Burn → Confirm
 
 # Result: New 25GB disc with 5.2GB used, 19.8GB free
 ```
@@ -202,7 +206,7 @@ Burn to Disc → Enter "BACKUP-2024-001" → Capacity: 25 → Start Burn
 Press 'b' → Add Files → /home/user/documents
 
 # Append to existing disc
-Burn to Disc → Click "BACKUP-2024-001" from table → Start Burn
+Burn to Disc → Click "BACKUP-2024-001" from table → Start Burn → Confirm
 
 # Result: Same disc now has 12.7GB used, 12.3GB free
 ```
@@ -229,20 +233,21 @@ Run the comprehensive test suite:
 python3 bluray_backup.py --test
 ```
 
-**Test Coverage:**
+**Test Coverage (55 tests):**
 
-- Database operations (17 tests)
-- File system operations (4 tests)
-- Burn engine operations (7 tests)
-- Input validation and edge cases
+- Database operations (19 tests — including double-write guard and capacity cap)
+- File system operations (6 tests — including missing-source skip)
+- Burn engine operations (13 tests — including Z/M flag enforcement and command builder)
+- Drive detection happy paths (4 tests — BD preference, drutil parsing, fallbacks)
+- Bug regression tests (13 tests — threaded burn, orphan rollback, DB path, modal CSS, capacity validation)
 
 ## Troubleshooting
 
-### “externally-managed-environment” error
+### "externally-managed-environment" error
 
 **Ubuntu/Debian users:** Use pipx or virtual environment (see Installation)
 
-### “No burning tool found”
+### "No burning tool found"
 
 **Linux:** Install growisofs
 
@@ -268,6 +273,10 @@ pip install --upgrade textual
 
 This is expected. The app burns at 4x speed intentionally — higher speeds (up to 6x) are supported by the hardware but are prone to write errors and disc failures. Patience here means a reliable backup.
 
+### Progress bar stops at 20%
+
+Also expected — see the note in the Burn workflow section above. The TUI cannot poll `growisofs` progress mid-burn; actual write progress is printed to your terminal.
+
 ## Technical Details
 
 ### Why UDF Instead of ISO?
@@ -275,7 +284,7 @@ This is expected. The app burns at 4x speed intentionally — higher speeds (up 
 - **Direct Access:** Browse files without extraction
 - **Multi-Session:** Append files to existing discs
 - **Compatibility:** Works on all major operating systems
-- **Simplicity:** Users understand “copy file from disc”
+- **Simplicity:** Users understand "copy file from disc"
 
 ### Why SQLite?
 
@@ -288,6 +297,10 @@ This is expected. The app burns at 4x speed intentionally — higher speeds (up 
 ### Why Not JSON/XML/MongoDB?
 
 See the SQLite vs JSON vs MongoDB comparison in the docs - SQLite is ideal for this single-user, local use case.
+
+## Changelog
+
+See `__version__` and `CHANGELOG` at the top of `bluray_backup.py` for the full version history.
 
 ## Contributing
 
@@ -328,6 +341,6 @@ For issues, questions, or suggestions:
 - Include Python version and OS
 - Include output of `python3 bluray_backup.py --test`
 
------
+---
 
 **Made with ❤️ for people who believe in physical backups**
