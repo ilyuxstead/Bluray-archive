@@ -24,7 +24,7 @@ from textual.app import App
 from textual.containers import Container, Horizontal
 from textual.widgets import Header, Footer, Button, DataTable, Input, Label, ProgressBar
 from textual.binding import Binding
-from textual.screen import Screen
+from textual.screen import Screen, ModalScreen
 
 # For compatibility with older Textual versions
 try:
@@ -365,6 +365,33 @@ class BurnEngine:
         return 'disk1'
     
     @staticmethod
+    def build_command(staging_dir: str, device: str, tool: str, label: str,
+                      is_new_disc: bool = True) -> List[str]:
+        """Build the burn command without executing it.
+        
+        Returns the exact command list that burn_udf would run, allowing
+        it to be displayed to the user before execution.
+        """
+        if tool == 'growisofs':
+            session_flag = '-Z' if is_new_disc else '-M'
+            return [
+                'growisofs',
+                f'{session_flag}={device}',
+                '-speed=4',
+                '-udf',
+                '-V', label.strip(),
+                '-r',
+                staging_dir
+            ]
+        elif tool == 'drutil':
+            cmd = ['drutil', 'burn', '-udf', '-noverify']
+            if not is_new_disc:
+                cmd.append('-append')
+            cmd.append(staging_dir)
+            return cmd
+        return []
+
+    @staticmethod
     def burn_udf(staging_dir: str, device: str, tool: str, label: str,
                  is_new_disc: bool = True) -> Tuple[bool, str]:
         """Burn files directly to disc with UDF filesystem.
@@ -393,26 +420,12 @@ class BurnEngine:
 
         try:
             if tool == 'growisofs':
-                # -Z starts a new disc (overwrites everything already on it).
-                # -M appends a new session, leaving existing sessions intact.
-                session_flag = '-Z' if is_new_disc else '-M'
+                cmd = BurnEngine.build_command(staging_dir, device, tool, label, is_new_disc)
 
-                cmd = [
-                    'growisofs',
-                    f'{session_flag}={device}',  # e.g. -Z=/dev/sr0 or -M=/dev/sr0
-                    '-speed=4',                  # 4x for reliability
-                    '-udf',                      # UDF filesystem
-                    '-V', label.strip(),         # volume label
-                    '-r',                        # Rock Ridge for long filenames
-                    staging_dir
-                ]
-
-                # Use Popen so growisofs can write progress to the terminal
-                # and doesn't block waiting for a pipe buffer to drain.
                 proc = subprocess.Popen(
                     cmd,
-                    stdout=None,          # inherit terminal
-                    stderr=None,          # inherit terminal (growisofs progress goes here)
+                    stdout=None,
+                    stderr=None,
                     stdin=subprocess.DEVNULL
                 )
                 try:
@@ -424,7 +437,6 @@ class BurnEngine:
                 if proc.returncode == 0:
                     return True, "Burn completed successfully"
 
-                # Non-zero exit: verify via mediainfo before giving up
                 try:
                     verify = subprocess.run(
                         ['dvd+rw-mediainfo', device],
@@ -438,14 +450,7 @@ class BurnEngine:
                 return False, f"growisofs exited with code {proc.returncode} — check terminal output above for details"
 
             elif tool == 'drutil':
-                # macOS: drutil burn with UDF
-                # drutil handles multi-session automatically when appending,
-                # but pass -append for clarity when not a new disc.
-                cmd = ['drutil', 'burn', '-udf', '-noverify']
-                if not is_new_disc:
-                    cmd.append('-append')
-                cmd.append(staging_dir)
-
+                cmd = BurnEngine.build_command(staging_dir, device, tool, label, is_new_disc)
                 result = subprocess.run(cmd, timeout=7200)
                 if result.returncode == 0:
                     return True, "Burn completed successfully"
@@ -484,7 +489,6 @@ class TestDatabase(unittest.TestCase):
         conn = sqlite3.connect(self.test_db.name)
         c = conn.cursor()
         
-        # Check tables exist
         c.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = [row[0] for row in c.fetchall()]
         
@@ -495,258 +499,181 @@ class TestDatabase(unittest.TestCase):
         conn.close()
     
     def test_add_disk_success(self):
-        """Test adding a valid disk"""
         success, msg, disk_id = self.db.add_disk("TEST-001", 25, "Test disk")
-        
         self.assertTrue(success)
         self.assertEqual(msg, "Disk added successfully")
         self.assertIsNotNone(disk_id)
         self.assertGreater(disk_id, 0)
     
     def test_add_disk_empty_label(self):
-        """Test adding disk with empty label"""
         success, msg, disk_id = self.db.add_disk("", 25)
-        
         self.assertFalse(success)
         self.assertEqual(msg, "Label cannot be empty")
         self.assertIsNone(disk_id)
     
     def test_add_disk_invalid_capacity(self):
-        """Test adding disk with invalid capacity"""
         success, msg, disk_id = self.db.add_disk("TEST-001", 0)
-        
         self.assertFalse(success)
         self.assertEqual(msg, "Capacity must be positive")
         self.assertIsNone(disk_id)
     
     def test_add_disk_duplicate_label(self):
-        """Test adding disk with duplicate label"""
         self.db.add_disk("TEST-001", 25)
         success, msg, disk_id = self.db.add_disk("TEST-001", 50)
-        
         self.assertFalse(success)
         self.assertEqual(msg, "Disk label already exists")
         self.assertIsNone(disk_id)
     
     def test_get_disks(self):
-        """Test retrieving all disks"""
         self.db.add_disk("TEST-001", 25)
         self.db.add_disk("TEST-002", 50)
-        
         disks = self.db.get_disks()
-        
         self.assertEqual(len(disks), 2)
-        # Verify both disks are present (order may vary due to timing)
         labels = [disk[1] for disk in disks]
         self.assertIn("TEST-001", labels)
         self.assertIn("TEST-002", labels)
     
     def test_get_disk_by_id(self):
-        """Test retrieving a specific disk by ID"""
         _, _, disk_id = self.db.add_disk("TEST-001", 25, "Notes")
-        
         disk = self.db.get_disk_by_id(disk_id)
-        
         self.assertIsNotNone(disk)
         self.assertEqual(disk[1], "TEST-001")
         self.assertEqual(disk[2], 25)
     
     def test_get_disk_by_label(self):
-        """Test retrieving a specific disk by label"""
         self.db.add_disk("TEST-001", 25, "Notes")
-        
         disk = self.db.get_disk_by_label("TEST-001")
-        
         self.assertIsNotNone(disk)
         self.assertEqual(disk[1], "TEST-001")
         self.assertEqual(disk[2], 25)
     
     def test_add_file_success(self):
-        """Test adding a valid file"""
         _, _, disk_id = self.db.add_disk("TEST-001", 25)
-        
         success, msg = self.db.add_file(disk_id, "/path/to/file.txt", "file.txt", 1.5)
-        
         self.assertTrue(success)
         self.assertEqual(msg, "File added successfully")
-        
-        # Verify disk usage updated
         disk = self.db.get_disk_by_id(disk_id)
-        self.assertEqual(disk[3], 1.5)  # used_gb
+        self.assertEqual(disk[3], 1.5)
     
     def test_add_file_invalid_disk(self):
-        """Test adding file to non-existent disk"""
         success, msg = self.db.add_file(9999, "/path/to/file.txt", "file.txt", 1.5)
-        
         self.assertFalse(success)
         self.assertEqual(msg, "Disk not found")
     
     def test_add_file_empty_path(self):
-        """Test adding file with empty path"""
         _, _, disk_id = self.db.add_disk("TEST-001", 25)
-        
         success, msg = self.db.add_file(disk_id, "", "file.txt", 1.5)
-        
         self.assertFalse(success)
         self.assertEqual(msg, "File path cannot be empty")
     
     def test_add_file_negative_size(self):
-        """Test adding file with negative size"""
         _, _, disk_id = self.db.add_disk("TEST-001", 25)
-        
         success, msg = self.db.add_file(disk_id, "/path/to/file.txt", "file.txt", -1.5)
-        
         self.assertFalse(success)
         self.assertEqual(msg, "File size cannot be negative")
     
     def test_get_files_for_disk(self):
-        """Test retrieving files for a disk"""
         _, _, disk_id = self.db.add_disk("TEST-001", 25)
         self.db.add_file(disk_id, "/path/to/file1.txt", "file1.txt", 1.0)
         self.db.add_file(disk_id, "/path/to/file2.txt", "file2.txt", 2.0)
-        
         files = self.db.get_files_for_disk(disk_id)
-        
         self.assertEqual(len(files), 2)
     
     def test_search_files(self):
-        """Test file search functionality"""
         _, _, disk_id = self.db.add_disk("TEST-001", 25)
         self.db.add_file(disk_id, "/home/user/documents/report.pdf", "report.pdf", 1.0)
         self.db.add_file(disk_id, "/home/user/photos/vacation.jpg", "vacation.jpg", 2.0)
-        
-        # Search for 'documents'
         results = self.db.search_files("documents")
         self.assertEqual(len(results), 1)
         self.assertIn("report.pdf", results[0][0])
-        
-        # Search for 'vacation'
         results = self.db.search_files("vacation")
         self.assertEqual(len(results), 1)
-        
-        # Search for non-existent
         results = self.db.search_files("nonexistent")
         self.assertEqual(len(results), 0)
     
     def test_search_files_empty_term(self):
-        """Test search with empty term"""
         results = self.db.search_files("")
         self.assertEqual(len(results), 0)
     
     def test_add_to_queue_success(self):
-        """Test adding to burn queue"""
         success, msg = self.db.add_to_queue("/path/to/file.txt", 1.5)
-        
         self.assertTrue(success)
         self.assertEqual(msg, "Added to queue")
-        
         queue = self.db.get_queue()
         self.assertEqual(len(queue), 1)
     
     def test_add_to_queue_empty_path(self):
-        """Test adding to queue with empty path"""
         success, msg = self.db.add_to_queue("", 1.5)
-        
         self.assertFalse(success)
         self.assertEqual(msg, "File path cannot be empty")
     
     def test_add_to_queue_negative_size(self):
-        """Test adding to queue with negative size"""
         success, msg = self.db.add_to_queue("/path/to/file.txt", -1.5)
-        
         self.assertFalse(success)
         self.assertEqual(msg, "File size cannot be negative")
     
     def test_get_queue(self):
-        """Test retrieving burn queue"""
         self.db.add_to_queue("/path/to/file1.txt", 1.0)
         self.db.add_to_queue("/path/to/file2.txt", 2.0)
-        
         queue = self.db.get_queue()
-        
         self.assertEqual(len(queue), 2)
     
     def test_remove_from_queue(self):
-        """Test removing item from queue"""
         self.db.add_to_queue("/path/to/file.txt", 1.0)
         queue = self.db.get_queue()
         queue_id = queue[0][0]
-        
         success, msg = self.db.remove_from_queue(queue_id)
-        
         self.assertTrue(success)
         self.assertEqual(msg, "Removed from queue")
-        
         queue = self.db.get_queue()
         self.assertEqual(len(queue), 0)
     
     def test_remove_from_queue_invalid_id(self):
-        """Test removing non-existent queue item"""
         success, msg = self.db.remove_from_queue(9999)
-        
         self.assertFalse(success)
         self.assertEqual(msg, "Queue item not found")
     
     def test_clear_queue(self):
-        """Test clearing entire queue"""
         self.db.add_to_queue("/path/to/file1.txt", 1.0)
         self.db.add_to_queue("/path/to/file2.txt", 2.0)
-        
         self.db.clear_queue()
-        
         queue = self.db.get_queue()
         self.assertEqual(len(queue), 0)
 
 
 class TestFileSystemHelper(unittest.TestCase):
-    """Test file system helper functions"""
     
     def setUp(self):
-        """Create temporary test files"""
         self.test_dir = tempfile.mkdtemp()
         self.test_file = Path(self.test_dir) / "test.txt"
         self.test_file.write_text("Hello World" * 100)
     
     def tearDown(self):
-        """Clean up temporary files"""
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
     
     def test_calculate_size_file(self):
-        """Test calculating size of a file"""
         size_gb = FileSystemHelper.calculate_size(self.test_file)
-        
         self.assertGreater(size_gb, 0)
-        self.assertLess(size_gb, 0.001)  # Should be very small
+        self.assertLess(size_gb, 0.001)
     
     def test_calculate_size_directory(self):
-        """Test calculating size of a directory"""
-        # Create additional files
         (Path(self.test_dir) / "file2.txt").write_text("Test" * 100)
-        
         size_gb = FileSystemHelper.calculate_size(Path(self.test_dir))
-        
         self.assertGreater(size_gb, 0)
     
     def test_calculate_size_nonexistent(self):
-        """Test calculating size of non-existent path"""
         size_gb = FileSystemHelper.calculate_size(Path("/nonexistent/path"))
-        
         self.assertEqual(size_gb, 0.0)
     
     def test_prepare_staging_area(self):
-        """Test preparing staging area for burn"""
         queue_items = [(1, str(self.test_file), 0.001, "2024-01-01")]
         staging_dir = tempfile.mkdtemp()
-        
         try:
             staging_path, file_map = FileSystemHelper.prepare_staging_area(queue_items, staging_dir)
-            
             self.assertTrue(os.path.exists(staging_path))
             self.assertEqual(len(file_map), 1)
             self.assertIn(str(self.test_file), file_map)
-            
-            # Verify file was copied
             staged_file = Path(staging_path) / "test.txt"
             self.assertTrue(staged_file.exists())
         finally:
@@ -755,83 +682,63 @@ class TestFileSystemHelper(unittest.TestCase):
 
 
 class TestBurnEngine(unittest.TestCase):
-    """Test burn engine functions"""
     
     def test_detect_burner(self):
-        """Test burner detection"""
         tool, device = BurnEngine.detect_burner()
-        
-        # Should return None or valid values
         if tool is not None:
             self.assertIn(tool, ['growisofs', 'drutil'])
             self.assertIsNotNone(device)
     
     def test_find_linux_drive(self):
-        """Test Linux drive detection"""
         drive = BurnEngine.find_linux_drive()
-        
         self.assertIsNotNone(drive)
         self.assertTrue(drive.startswith('/dev/'))
     
     def test_find_macos_drive(self):
-        """Test macOS drive detection"""
         drive = BurnEngine.find_macos_drive()
-        
         self.assertIsNotNone(drive)
     
     def test_burn_udf_invalid_staging(self):
-        """Test burn with invalid staging directory"""
         success, msg = BurnEngine.burn_udf("/nonexistent", "/dev/sr0", "growisofs", "TEST")
-        
         self.assertFalse(success)
         self.assertIn("does not exist", msg)
     
     def test_burn_udf_no_device(self):
-        """Test burn with no device"""
         staging = tempfile.mkdtemp()
         try:
             success, msg = BurnEngine.burn_udf(staging, "", "growisofs", "TEST")
-            
             self.assertFalse(success)
             self.assertIn("No device", msg)
         finally:
             shutil.rmtree(staging)
     
     def test_burn_udf_no_tool(self):
-        """Test burn with no tool"""
         staging = tempfile.mkdtemp()
         try:
             success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "", "TEST")
-            
             self.assertFalse(success)
             self.assertIn("No burning tool", msg)
         finally:
             shutil.rmtree(staging)
     
     def test_burn_udf_empty_label(self):
-        """Test burn with empty label"""
         staging = tempfile.mkdtemp()
         try:
             success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "")
-            
             self.assertFalse(success)
             self.assertIn("Label cannot be empty", msg)
         finally:
             shutil.rmtree(staging)
 
     def test_burn_udf_new_disc_uses_Z_flag(self):
-        """Test that new disc burns use -Z (overwrite/new session) flag"""
         staging = tempfile.mkdtemp()
         try:
             captured_cmd = []
-
             def mock_popen(cmd, **kwargs):
                 captured_cmd.extend(cmd)
                 raise FileNotFoundError("growisofs not available in test environment")
-
             with unittest.mock.patch('subprocess.Popen', side_effect=mock_popen):
                 success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-NEW", is_new_disc=True)
-
             if captured_cmd:
                 self.assertIn('-Z=/dev/sr0', captured_cmd)
                 self.assertNotIn('-M=/dev/sr0', captured_cmd)
@@ -839,18 +746,14 @@ class TestBurnEngine(unittest.TestCase):
             shutil.rmtree(staging)
 
     def test_burn_udf_append_uses_M_flag(self):
-        """Test that appending to existing disc uses -M (multi-session) flag"""
         staging = tempfile.mkdtemp()
         try:
             captured_cmd = []
-
             def mock_popen(cmd, **kwargs):
                 captured_cmd.extend(cmd)
                 raise FileNotFoundError("growisofs not available in test environment")
-
             with unittest.mock.patch('subprocess.Popen', side_effect=mock_popen):
                 success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-EXISTING", is_new_disc=False)
-
             if captured_cmd:
                 self.assertIn('-M=/dev/sr0', captured_cmd)
                 self.assertNotIn('-Z=/dev/sr0', captured_cmd)
@@ -858,7 +761,6 @@ class TestBurnEngine(unittest.TestCase):
             shutil.rmtree(staging)
 
     def test_burn_udf_valid_inputs(self):
-        """Test burn with valid inputs - real growisofs attempt (will fail without hardware)"""
         staging = tempfile.mkdtemp()
         try:
             success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-001")
@@ -867,6 +769,18 @@ class TestBurnEngine(unittest.TestCase):
             self.assertGreater(len(msg), 0)
         finally:
             shutil.rmtree(staging)
+
+    def test_build_command_new_disc(self):
+        """Test that build_command returns -Z flag for new discs"""
+        cmd = BurnEngine.build_command("/tmp/staging", "/dev/sr0", "growisofs", "TEST", is_new_disc=True)
+        self.assertIn('-Z=/dev/sr0', cmd)
+        self.assertNotIn('-M=/dev/sr0', cmd)
+
+    def test_build_command_append(self):
+        """Test that build_command returns -M flag for appending"""
+        cmd = BurnEngine.build_command("/tmp/staging", "/dev/sr0", "growisofs", "TEST", is_new_disc=False)
+        self.assertIn('-M=/dev/sr0', cmd)
+        self.assertNotIn('-Z=/dev/sr0', cmd)
 
 
 # ============================================================================
@@ -899,22 +813,16 @@ class SearchScreen(Screen):
             self.perform_search()
     
     def perform_search(self) -> None:
-        """Execute the search and display results"""
         search_term = self.query_one("#search_term", Input).value
-        
         if not search_term:
             self.notify("Please enter a search term!", severity="warning")
             return
-        
         db = Database()
         results = db.search_files(search_term)
-        
         table = self.query_one("#search_results", DataTable)
         table.clear()
-        
         if not table.columns:
             table.add_columns("Original Path", "Path on Disc", "Size (GB)", "Backup Date", "Disk Label")
-        
         if results:
             for filepath, disk_path, size, date, disk_label in results:
                 table.add_row(filepath, disk_path, f"{size:.2f}", date, disk_label)
@@ -951,34 +859,27 @@ class AddToQueueScreen(Screen):
             self.app.pop_screen()
     
     def add_to_queue(self) -> None:
-        """Add the specified path to the burn queue. Supports wildcards e.g. /home/user/*.jpg"""
         filepath = self.query_one("#filepath", Input).value.strip()
-        
         if not filepath:
             self.query_one("#message", Label).update("Path is required!")
             return
-
         try:
             filepath = str(Path(filepath).expanduser())
-
             if '*' in filepath or '?' in filepath:
                 parent = Path(filepath).parent
                 pattern = Path(filepath).name
-
                 if not parent.exists():
                     self.query_one("#message", Label).update(
                         f"Directory not found: {parent}\n"
                         f"Note: Linux paths are case-sensitive (use /home not /Home)"
                     )
                     return
-
                 matched_files = sorted(parent.glob(pattern))
                 if not matched_files:
                     self.query_one("#message", Label).update(
                         f"No files matched '{pattern}' in {parent}"
                     )
                     return
-
                 db = Database()
                 added = 0
                 for match in matched_files:
@@ -987,7 +888,6 @@ class AddToQueueScreen(Screen):
                         success, msg = db.add_to_queue(str(match), round(size_gb, 4))
                         if success:
                             added += 1
-
                 if added > 0:
                     self.notify(f"Added {added} file(s) to queue", severity="information")
                     self.app.pop_screen()
@@ -1001,19 +901,77 @@ class AddToQueueScreen(Screen):
                         f"Note: Linux paths are case-sensitive (use /home not /Home)"
                     )
                     return
-
                 size_gb = FileSystemHelper.calculate_size(path)
                 db = Database()
                 success, msg = db.add_to_queue(str(path), round(size_gb, 2))
-
                 if success:
                     self.notify(f"Added to queue: {size_gb:.2f} GB", severity="information")
                     self.app.pop_screen()
                 else:
                     self.query_one("#message", Label).update(msg)
-
         except Exception as e:
             self.query_one("#message", Label).update(f"Error: {str(e)}")
+
+
+class BurnConfirmModal(ModalScreen):
+    """Modal confirmation dialog shown before any burn operation.
+    
+    Displays the exact command, device, tool, session mode, and queue
+    summary so the user can verify everything looks correct before
+    committing to a potentially long, irreversible burn.
+    """
+
+    def __init__(self,
+                 tool: str,
+                 device: str,
+                 label: str,
+                 is_new_disc: bool,
+                 file_count: int,
+                 total_size_gb: float,
+                 command: List[str]):
+        super().__init__()
+        self.tool = tool
+        self.device = device
+        self.label = label
+        self.is_new_disc = is_new_disc
+        self.file_count = file_count
+        self.total_size_gb = total_size_gb
+        self.command = command
+
+    def compose(self) -> ComposeResult:
+        mode = "NEW DISC (overwrite/first burn)" if self.is_new_disc else "APPEND (existing data preserved)"
+        plain_english = (
+            f"{'Starting new disc' if self.is_new_disc else 'Appending to existing disc'} "
+            f"'{self.label}' on {self.device} using {self.tool}"
+        )
+        command_str = " ".join(self.command)
+
+        yield Container(
+            Label("⚠  Confirm Burn Operation", id="modal_title"),
+            Label("─" * 56, id="divider1"),
+            Label(plain_english, id="plain_summary"),
+            Label("─" * 56, id="divider2"),
+            Label(f"  Tool:      {self.tool}", id="info_tool"),
+            Label(f"  Device:    {self.device}", id="info_device"),
+            Label(f"  Mode:      {mode}", id="info_mode"),
+            Label(f"  Files:     {self.file_count} file(s)  /  {self.total_size_gb:.2f} GB total", id="info_files"),
+            Label("─" * 56, id="divider3"),
+            Label("  Full command:", id="cmd_header"),
+            Label(f"  {command_str}", id="info_command"),
+            Label("─" * 56, id="divider4"),
+            Label("This operation may take 30–45 minutes.", id="warning_time"),
+            Horizontal(
+                Button("Confirm — Start Burn", variant="error", id="confirm"),
+                Button("Cancel", variant="default", id="cancel"),
+            ),
+            id="confirm_modal"
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm":
+            self.dismiss(True)
+        elif event.button.id == "cancel":
+            self.dismiss(False)
 
 
 class BurnScreen(Screen):
@@ -1049,14 +1007,11 @@ class BurnScreen(Screen):
         yield Footer()
     
     def on_mount(self) -> None:
-        """Populate disk selector table with existing disks"""
         table = self.query_one("#disk_selector", DataTable)
         table.cursor_type = "row"
         table.add_columns("Label", "Used", "Free", "Capacity")
-        
         db = Database()
         disks = db.get_disks()
-        
         if disks:
             for disk in disks:
                 _, label, capacity, used, _, _ = disk
@@ -1072,20 +1027,14 @@ class BurnScreen(Screen):
             self.query_one("#status", Label).update("No existing disks - create a new one below")
     
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Handle disk selection from table"""
         if event.data_table.id == "disk_selector":
             table = self.query_one("#disk_selector", DataTable)
             row = table.get_row_at(event.cursor_row)
             selected_label = row[0]
-            
-            # Auto-fill the label input
             self.query_one("#label", Input).value = selected_label
-
-            # Look up used_gb to determine physical state
             db = Database()
             disk = db.get_disk_by_label(selected_label)
             used_gb = disk[3] if disk else 0
-
             if used_gb == 0:
                 self.query_one("#status", Label).update(
                     f"Selected disk: {selected_label} — registered but never burned, will use -Z (new disc)"
@@ -1102,89 +1051,84 @@ class BurnScreen(Screen):
             self.app.pop_screen()
     
     def start_burn(self) -> None:
-        """Validate inputs and start the burn process"""
+        """Validate inputs, then show confirmation modal before burning."""
         label = self.query_one("#label", Input).value.strip()
         capacity = self.query_one("#capacity", Input).value.strip()
-        
+
         if not label:
             self.query_one("#message", Label).update("Label is required!")
             return
-        
+
         db = Database()
-        
-        # Determine physical disc state based on used_gb, not mere DB presence.
-        #
-        # A disk can be pre-registered in the DB (used_gb == 0) but still be
-        # a blank, unwritten disc.  We must use -Z for physically blank media
-        # and -M only when data has already been burned.
-        # • Using -M on a blank disc  → growisofs error / burn fails
-        # • Using -Z on a written disc → silently destroys all existing data
         existing_disk = db.get_disk_by_label(label)
-        
+
         if existing_disk:
             disk_id = existing_disk[0]
             capacity_gb = existing_disk[2]
             used_gb = existing_disk[3]
-
-            # is_new_disc == True means "physically blank" — nothing burned yet
             is_new_disc = (used_gb == 0)
-
             total_size = sum(item[2] for item in self.queue_items)
             available_space = capacity_gb - used_gb
-            
+
             if total_size > available_space:
                 self.query_one("#message", Label).update(
                     f"Not enough space! Need {total_size:.2f} GB, only {available_space:.2f} GB available"
                 )
                 return
-            
-            if is_new_disc:
-                self.query_one("#status", Label).update(
-                    f"Disk '{label}' is registered but blank — burning as new disc (-Z)"
-                )
-            else:
-                self.query_one("#status", Label).update(
-                    f"Appending to existing disk: {label} (existing data will be preserved)"
-                )
         else:
-            # Brand-new label — not in DB at all, definitely a blank disc
             is_new_disc = True
-
             if not capacity:
                 self.query_one("#message", Label).update("Capacity is required for new disks!")
                 return
-            
             try:
                 capacity_gb = int(capacity)
             except ValueError:
                 self.query_one("#message", Label).update("Capacity must be a number!")
                 return
-            
             total_size = sum(item[2] for item in self.queue_items)
             if total_size > capacity_gb:
                 self.query_one("#message", Label).update(f"Queue too large! {total_size:.2f} GB > {capacity_gb} GB")
                 return
-            
             success, msg, disk_id = db.add_disk(label, capacity_gb, "Burned with UDF filesystem")
-            
             if not success:
                 self.query_one("#message", Label).update(msg)
                 return
-            
-            self.query_one("#status", Label).update(f"Creating new disk: {label}")
-        
+
         # Detect burning hardware
         tool, device = BurnEngine.detect_burner()
-        
         if not tool:
             self.query_one("#message", Label).update(
                 "No burning tool found! Install: growisofs (Linux) or use built-in tools (macOS)"
             )
             return
-        
-        self.query_one("#status", Label).update(f"Using {tool} on {device}")
-        self.perform_burn(disk_id, label, device, tool, is_new_disc)
-    
+
+        # Build the exact command that will be run — using a placeholder staging
+        # path since the real staging dir hasn't been created yet. The placeholder
+        # makes the intent clear without exposing a temp path that doesn't exist yet.
+        preview_cmd = BurnEngine.build_command(
+            "<staging-dir>", device, tool, label, is_new_disc
+        )
+
+        file_count = len(self.queue_items)
+        total_size_gb = sum(item[2] for item in self.queue_items)
+
+        def on_confirm(confirmed: bool) -> None:
+            if confirmed:
+                self.perform_burn(disk_id, label, device, tool, is_new_disc)
+
+        self.app.push_screen(
+            BurnConfirmModal(
+                tool=tool,
+                device=device,
+                label=label,
+                is_new_disc=is_new_disc,
+                file_count=file_count,
+                total_size_gb=total_size_gb,
+                command=preview_cmd,
+            ),
+            on_confirm
+        )
+
     def perform_burn(self, disk_id: int, label: str, device: str, tool: str,
                      is_new_disc: bool) -> None:
         """Execute the burn process and record files in database"""
@@ -1252,7 +1196,7 @@ class BurnScreen(Screen):
                     if Path(staging_dir).exists():
                         shutil.rmtree(staging_dir)
                 except Exception:
-                    pass  # Cleanup failure should not mask the original error
+                    pass
 
 
 class AddDiskScreen(Screen):
@@ -1286,20 +1230,16 @@ class AddDiskScreen(Screen):
             self.app.pop_screen()
     
     def add_disk(self) -> None:
-        """Add a new disk to the database"""
         label = self.query_one("#label", Input).value
         capacity = self.query_one("#capacity", Input).value
         notes = self.query_one("#notes", Input).value
-        
         if not label or not capacity:
             self.query_one("#message", Label).update("Label and capacity are required!")
             return
-        
         try:
             capacity_gb = int(capacity)
             db = Database()
             success, msg, _ = db.add_disk(label, capacity_gb, notes)
-            
             if success:
                 self.app.pop_screen()
             else:
@@ -1335,18 +1275,15 @@ class QueueScreen(Screen):
         self.refresh_queue()
     
     def refresh_queue(self) -> None:
-        """Refresh the queue table display"""
         db = Database()
         queue = db.get_queue()
         table = self.query_one("#queue_table", DataTable)
         table.clear()
-        
         total_size = 0
         for item in queue:
             queue_id, filepath, size, added = item
             table.add_row(str(queue_id), filepath, f"{size:.2f}", added.split()[0])
             total_size += size
-        
         self.query_one("#title", Label).update(f"Burn Queue - Total: {total_size:.2f} GB")
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -1405,12 +1342,10 @@ class DiskFilesScreen(Screen):
         table = self.query_one("#files_table", DataTable)
         table.cursor_type = "row"
         table.add_columns("Original Path", "Path on Disc", "Size (GB)", "Backup Date")
-
         db = Database()
         files = db.get_files_for_disk(self.disk_id)
         for _, file_path, disk_path, size, date in files:
             table.add_row(file_path, disk_path, f"{size:.4f}", date)
-
         if not files:
             self.notify("No files recorded for this disk yet.", severity="information")
 
@@ -1520,6 +1455,44 @@ class BlurayBackupApp(App):
         background: $panel;
         margin: 0 2 1 2;
     }
+
+    #confirm_modal {
+        width: 64;
+        height: auto;
+        border: thick $error 80%;
+        background: $surface;
+        padding: 1 2;
+        margin: 4 8;
+    }
+
+    #modal_title {
+        text-style: bold;
+        color: $error;
+        margin-bottom: 1;
+    }
+
+    #plain_summary {
+        color: $text;
+        margin: 1 0;
+    }
+
+    #info_mode {
+        color: $warning;
+    }
+
+    #info_command {
+        color: $accent;
+        margin-bottom: 1;
+    }
+
+    #warning_time {
+        color: $warning;
+        margin: 1 0;
+    }
+
+    #divider1, #divider2, #divider3, #divider4 {
+        color: $text-muted;
+    }
     """
     
     BINDINGS = [
@@ -1561,10 +1534,8 @@ class BlurayBackupApp(App):
         self.refresh_table()
     
     def refresh_table(self) -> None:
-        """Refresh the main disk table"""
         table = self.query_one("#disks_table", DataTable)
         table.clear()
-        
         disks = self.db.get_disks()
         for disk in disks:
             disk_id, label, capacity, used, created, notes = disk
@@ -1592,12 +1563,10 @@ class BlurayBackupApp(App):
             self.refresh_table()
     
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Handle row selection in main disk table"""
         if event.data_table.id == "disks_table":
             table = self.query_one("#disks_table", DataTable)
             row = table.get_row_at(event.cursor_row)
             self.selected_disk = (int(row[0]), row[1])
-            
             info = self.query_one("#info", Container)
             info.query_one(Label).update(
                 f"Selected: {row[1]} | Capacity: {row[2]}GB | Used: {row[3]}GB | Free: {row[4]}"
@@ -1628,7 +1597,6 @@ class BlurayBackupApp(App):
 # ============================================================================
 
 def run_tests():
-    """Run all unit tests"""
     print("=" * 70)
     print("Running Unit Tests for Blu-ray Backup Manager")
     print("=" * 70)
