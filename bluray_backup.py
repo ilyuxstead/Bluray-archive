@@ -8,6 +8,24 @@ Run tests: python bluray_backup.py --test
 Run app: python bluray_backup.py
 """
 
+__version__ = "1.1.0"
+
+CHANGELOG = """
+v1.1.0 (2026-03-08)
+  - #9  Fixed vacuous-pass risk in Z/M flag tests; mock call now asserted.
+  - #10 Added happy-path tests for find_linux_drive (BD preference) and
+        find_macos_drive (drutil name parsing).
+  - #11 Confirm modal now labels the <staging-dir> placeholder with a note.
+  - #12 README test badge updated to current count (55).
+  - #13 Progress bar cosmetic nature noted in BurnScreen UI.
+  - #14 Added __version__ and CHANGELOG.
+
+v1.0.0 (initial release)
+  - Bugs 1–8 resolved (multi-session Z/M flag logic, DB path fix, threaded
+    burn, orphan rollback, double-write guard, queue partial-clear, capacity
+    validation, responsive confirm modal CSS).
+"""
+
 import glob
 import sqlite3
 import os
@@ -796,10 +814,12 @@ class TestBurnEngine(unittest.TestCase):
                 captured_cmd.extend(cmd)
                 raise FileNotFoundError("growisofs not available in test environment")
             with unittest.mock.patch('subprocess.Popen', side_effect=mock_popen):
-                success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-NEW", is_new_disc=True)
-            if captured_cmd:
-                self.assertIn('-Z=/dev/sr0', captured_cmd)
-                self.assertNotIn('-M=/dev/sr0', captured_cmd)
+                BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-NEW", is_new_disc=True)
+            # #9 fix: assert mock was actually called — an empty captured_cmd means
+            # the command was never built, which would let the test pass vacuously.
+            self.assertTrue(captured_cmd, "mock_popen was never called — command was not built")
+            self.assertIn('-Z=/dev/sr0', captured_cmd)
+            self.assertNotIn('-M=/dev/sr0', captured_cmd)
         finally:
             shutil.rmtree(staging)
 
@@ -811,10 +831,12 @@ class TestBurnEngine(unittest.TestCase):
                 captured_cmd.extend(cmd)
                 raise FileNotFoundError("growisofs not available in test environment")
             with unittest.mock.patch('subprocess.Popen', side_effect=mock_popen):
-                success, msg = BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-EXISTING", is_new_disc=False)
-            if captured_cmd:
-                self.assertIn('-M=/dev/sr0', captured_cmd)
-                self.assertNotIn('-Z=/dev/sr0', captured_cmd)
+                BurnEngine.burn_udf(staging, "/dev/sr0", "growisofs", "TEST-EXISTING", is_new_disc=False)
+            # #9 fix: assert mock was actually called — an empty captured_cmd means
+            # the command was never built, which would let the test pass vacuously.
+            self.assertTrue(captured_cmd, "mock_popen was never called — command was not built")
+            self.assertIn('-M=/dev/sr0', captured_cmd)
+            self.assertNotIn('-Z=/dev/sr0', captured_cmd)
         finally:
             shutil.rmtree(staging)
 
@@ -837,6 +859,49 @@ class TestBurnEngine(unittest.TestCase):
         cmd = BurnEngine.build_command("/tmp/staging", "/dev/sr0", "growisofs", "TEST", is_new_disc=False)
         self.assertIn('-M=/dev/sr0', cmd)
         self.assertNotIn('-Z=/dev/sr0', cmd)
+
+
+class TestBurnEngineDetection(unittest.TestCase):
+    """#10: Happy-path tests for find_linux_drive and find_macos_drive."""
+
+    def test_find_linux_drive_prefers_bd(self):
+        """find_linux_drive must return the drive whose mediainfo mentions 'BD'."""
+        with unittest.mock.patch('glob.glob', return_value=['/dev/sr0', '/dev/sr1']):
+            def fake_run(cmd, **kwargs):
+                drive = cmd[-1]
+                r = unittest.mock.MagicMock()
+                r.stdout = 'BD-RE\nDisc status: complete' if drive == '/dev/sr1' else 'DVD+RW'
+                r.returncode = 0
+                return r
+            with unittest.mock.patch('subprocess.run', side_effect=fake_run):
+                result = BurnEngine.find_linux_drive()
+        self.assertEqual(result, '/dev/sr1')
+
+    def test_find_linux_drive_fallback_to_last(self):
+        """When no drive reports BD, find_linux_drive must return the last /dev/sr*."""
+        with unittest.mock.patch('glob.glob', return_value=['/dev/sr0', '/dev/sr1']):
+            def fake_run(cmd, **kwargs):
+                r = unittest.mock.MagicMock()
+                r.stdout = 'DVD+RW'
+                r.returncode = 0
+                return r
+            with unittest.mock.patch('subprocess.run', side_effect=fake_run):
+                result = BurnEngine.find_linux_drive()
+        self.assertEqual(result, '/dev/sr1')
+
+    def test_find_macos_drive_parses_name(self):
+        """find_macos_drive must parse the 'Name:' line from drutil status output."""
+        mock_result = unittest.mock.MagicMock()
+        mock_result.stdout = "Vendor   Name: disk2\nType: BD-RE\n"
+        with unittest.mock.patch('subprocess.run', return_value=mock_result):
+            result = BurnEngine.find_macos_drive()
+        self.assertEqual(result, 'disk2')
+
+    def test_find_macos_drive_fallback(self):
+        """find_macos_drive must return 'disk1' when drutil fails."""
+        with unittest.mock.patch('subprocess.run', side_effect=Exception("drutil not found")):
+            result = BurnEngine.find_macos_drive()
+        self.assertEqual(result, 'disk1')
 
 
 # ============================================================================
@@ -1007,7 +1072,7 @@ class BurnConfirmModal(ModalScreen):
             Label(f"  Mode:      {mode}", id="info_mode"),
             Label(f"  Files:     {self.file_count} file(s)  /  {self.total_size_gb:.2f} GB total", id="info_files"),
             Label("─" * 40, id="divider3"),
-            Label("  Full command:", id="cmd_header"),
+            Label("  Full command (shown with actual staging path at burn time):", id="cmd_header"),
             Label(f"  {command_str}", id="info_command"),
             Label("─" * 40, id="divider4"),
             Label("This operation may take 30–45 minutes.", id="warning_time"),
@@ -1048,6 +1113,10 @@ class BurnScreen(Screen):
             Label("Multi-session: You can add to existing disks until full"),
             Label("Status:", id="status"),
             ProgressBar(total=100, show_eta=False, id="progress"),
+            Label(
+                "Note: bar pauses at 20% during the burn — live growisofs output appears in your terminal.",
+                id="progress_note"
+            ),
             Horizontal(
                 Button("Start Burn", variant="primary", id="burn"),
                 Button("Cancel", variant="default", id="cancel"),
@@ -1633,6 +1702,11 @@ class BlurayBackupApp(App):
         margin: 0 2 1 2;
     }
 
+    #progress_note {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
     /* Bug 7 fix: fluid width with min/max bounds so the modal never clips
        on narrow terminals (e.g. 80-col tmux panes).  The fixed width: 64
        baseline has been replaced with a responsive rule set.            */
@@ -1939,7 +2013,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestDatabase))
     suite.addTests(loader.loadTestsFromTestCase(TestFileSystemHelper))
     suite.addTests(loader.loadTestsFromTestCase(TestBurnEngine))
-    suite.addTests(loader.loadTestsFromTestCase(TestBug4ThreadedBurn))
+    suite.addTests(loader.loadTestsFromTestCase(TestBurnEngineDetection))
     suite.addTests(loader.loadTestsFromTestCase(TestBug5OrphanRollback))
     suite.addTests(loader.loadTestsFromTestCase(TestBug6DBPath))
     suite.addTests(loader.loadTestsFromTestCase(TestBug7ModalCSS))
